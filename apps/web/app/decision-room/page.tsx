@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+
+import { ChamberSeats, DEBATE_AGENTS } from "./ChamberSeats";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
@@ -129,6 +131,19 @@ export default function DecisionRoomPage() {
   const [runId, setRunId] = useState<number | null>(null);
   const [voteOptions, setVoteOptions] = useState<VoteOptions["options"] | null>(null);
   const [voteTally, setVoteTally] = useState<VoteTally | null>(null);
+  const [streamingAgentId, setStreamingAgentId] = useState<string | null>(null);
+  const [flashAgentId, setFlashAgentId] = useState<string | null>(null);
+  const flashClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debateScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const clearFlashTimer = useCallback(() => {
+    if (flashClearRef.current) {
+      clearTimeout(flashClearRef.current);
+      flashClearRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => () => clearFlashTimer(), [clearFlashTimer]);
 
   const canRun = useMemo(
     () => context.trim().length >= 10 && !running,
@@ -148,6 +163,23 @@ export default function DecisionRoomPage() {
     return Math.max(0, Math.ceil((end - nowMs) / 1000));
   }, [sessionClock, debatePhaseOver, nowMs]);
 
+  const activeMemberId =
+    currentAgent && currentAgent.id !== "synthesizer" ? currentAgent.id : null;
+  const synthesizerActive = currentAgent?.id === "synthesizer";
+
+  const agentHighlightId = useMemo(() => {
+    if (synthesizerActive) return null;
+    if (streamingAgentId) return streamingAgentId;
+    if (flashAgentId) return flashAgentId;
+    return activeMemberId;
+  }, [synthesizerActive, flashAgentId, streamingAgentId, activeMemberId]);
+
+  useLayoutEffect(() => {
+    const el = debateScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+  }, [turns, error, voteOptions, voteTally, report, runId, currentAgent, debatePhaseOver]);
+
   const runDebate = useCallback(async () => {
     setRunning(true);
     setError(null);
@@ -159,6 +191,9 @@ export default function DecisionRoomPage() {
     setVoteTally(null);
     setSessionClock(null);
     setDebatePhaseOver(false);
+    setStreamingAgentId(null);
+    setFlashAgentId(null);
+    clearFlashTimer();
     setNowMs(Date.now());
 
     try {
@@ -218,6 +253,8 @@ export default function DecisionRoomPage() {
             case "agent_start": {
               const e = ev as AgentStart;
               const tn = typeof e.turn === "number" ? e.turn : 1;
+              setFlashAgentId(null);
+              clearFlashTimer();
               setCurrentAgent({ id: e.agent, name: e.name, turn: tn });
               setTurns((prev) => [
                 ...prev,
@@ -234,6 +271,7 @@ export default function DecisionRoomPage() {
             }
             case "reasoning_token": {
               const e = ev as ReasoningToken;
+              setStreamingAgentId(e.agent);
               setTurns((prev) => {
                 if (prev.length === 0) return prev;
                 const next = [...prev];
@@ -248,6 +286,7 @@ export default function DecisionRoomPage() {
             }
             case "token": {
               const e = ev as Token;
+              setStreamingAgentId(e.agent);
               setTurns((prev) => {
                 if (prev.length === 0) return prev;
                 const next = [...prev];
@@ -261,9 +300,17 @@ export default function DecisionRoomPage() {
             }
             case "agent_end":
               setCurrentAgent(null);
+              setStreamingAgentId(null);
               break;
             case "interjection": {
               const e = ev as InterjectionEvent;
+              setStreamingAgentId(null);
+              setFlashAgentId(e.agent);
+              clearFlashTimer();
+              flashClearRef.current = setTimeout(() => {
+                setFlashAgentId(null);
+                flashClearRef.current = null;
+              }, 2500);
               setTurns((prev) => [
                 ...prev,
                 {
@@ -285,6 +332,9 @@ export default function DecisionRoomPage() {
               setVoteTally(ev as VoteTally);
               break;
             case "synthesizer_start":
+              setStreamingAgentId(null);
+              setFlashAgentId(null);
+              clearFlashTimer();
               setCurrentAgent({ id: "synthesizer", name: "Chief Synthesizer" });
               break;
             case "final_report":
@@ -309,28 +359,44 @@ export default function DecisionRoomPage() {
     } finally {
       setRunning(false);
       setCurrentAgent(null);
+      setStreamingAgentId(null);
+      setFlashAgentId(null);
+      clearFlashTimer();
     }
-  }, [context, model, sessionDurationInput, consensusThreshold, enableInterjections]);
+  }, [
+    context,
+    model,
+    sessionDurationInput,
+    consensusThreshold,
+    enableInterjections,
+    clearFlashTimer,
+  ]);
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-6">
-      <header className="flex items-center justify-between gap-4">
+    <main className="mx-auto box-border flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-4 overflow-hidden p-6">
+      <header className="shrink-0 flex flex-col gap-3 border-b border-white/10 pb-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Decision Room</h1>
-          <p className="text-sm text-[var(--muted)]">
-            Timed debate (max three sentences per turn), parallel interjections, then vote and Chief
-            Synthesizer in the last {sessionClock?.synth_reserve_sec ?? 30}s of your chosen session length
-            (≥ threshold votes on one option for consensus).
+          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--muted)]">
+            Timed debate (max three sentences per turn), optional interjections, then vote and Chief Synthesizer
+            in the last {sessionClock?.synth_reserve_sec ?? 30}s of the session.
           </p>
         </div>
-        <Link
-          href="/"
-          className="text-sm text-[var(--muted)] hover:text-[var(--foreground)]"
-        >
+        <Link href="/" className="shrink-0 text-sm text-[var(--muted)] hover:text-[var(--foreground)]">
           Home
         </Link>
       </header>
 
+      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row lg:items-stretch lg:gap-6">
+        <aside className="order-1 flex min-h-0 min-w-0 flex-[1.15] flex-col overflow-y-auto lg:order-1">
+          <ChamberSeats
+            synthesizerActive={synthesizerActive}
+            agentHighlightId={agentHighlightId}
+          />
+        </aside>
+
+        <div className="order-2 flex min-h-0 w-full min-w-0 flex-1 flex-col gap-4 lg:order-2 lg:h-full lg:w-[420px] lg:max-w-[420px] lg:shrink-0 lg:flex-none">
+          <section className="shrink-0 flex flex-col gap-4 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
       <label className="flex flex-col gap-2">
         <span className="text-sm font-medium">Context</span>
         <textarea
@@ -341,6 +407,13 @@ export default function DecisionRoomPage() {
           disabled={running}
         />
       </label>
+
+      {running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver && (
+        <p className="text-xs text-[var(--muted)]">
+          Debate segment: ~<span className="text-[var(--foreground)]">{debateSecondsLeft}s</span> left (session{" "}
+          {sessionClock.session_duration_sec}s; last {sessionClock.synth_reserve_sec}s for synthesizer)
+        </p>
+      )}
 
       <div className="flex flex-wrap items-end gap-4">
         <label className="flex flex-col gap-1">
@@ -383,7 +456,7 @@ export default function DecisionRoomPage() {
           <input
             type="number"
             min={1}
-            max={5}
+            max={DEBATE_AGENTS.length}
             className="w-20 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
             value={consensusThreshold}
             onChange={(e) => setConsensusThreshold(Number(e.target.value) || 3)}
@@ -404,23 +477,24 @@ export default function DecisionRoomPage() {
           type="button"
           onClick={runDebate}
           disabled={!canRun}
-          className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+          className="w-fit rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
         >
           {running ? "Running…" : "Run debate"}
         </button>
       </div>
+          </section>
 
+          <section
+            className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30"
+            aria-label="Session output: status, debate, votes, report"
+          >
+            <div
+              ref={debateScrollRef}
+              className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [scrollbar-gutter:stable]"
+            >
       {error && (
         <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
           {error}
-        </p>
-      )}
-
-      {running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver && (
-        <p className="text-xs text-[var(--muted)]">
-          Debate segment: ~<span className="text-[var(--foreground)]">{debateSecondsLeft}s</span> left
-          (total session {sessionClock.session_duration_sec}s; last {sessionClock.synth_reserve_sec}s reserved
-          for synthesizer)
         </p>
       )}
 
@@ -492,8 +566,8 @@ export default function DecisionRoomPage() {
         <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
           <h2 className="text-sm font-semibold text-[var(--foreground)]">Vote tally</h2>
           <p className="mt-2 text-sm text-[var(--muted)]">
-            Threshold: at least <strong className="text-[var(--foreground)]">{voteTally.threshold}</strong>{" "}
-            of 5 on one option.
+            Threshold: at least <strong className="text-[var(--foreground)]">{voteTally.threshold}</strong> of{" "}
+            {DEBATE_AGENTS.length} on one option.
             {voteTally.consensus_reached ? (
               <span className="ml-2 text-green-400">Consensus reached.</span>
             ) : (
@@ -532,9 +606,7 @@ export default function DecisionRoomPage() {
 
       {report && (
         <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">
-            Chief Synthesizer — report
-          </h2>
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">Chief Synthesizer — report</h2>
           <p className="mt-3 text-sm leading-relaxed">{report.summary}</p>
           <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
             Ranked options
@@ -574,6 +646,10 @@ export default function DecisionRoomPage() {
       {runId !== null && (
         <p className="text-xs text-[var(--muted)]">Saved as run #{runId}</p>
       )}
+            </div>
+          </section>
+        </div>
+      </div>
     </main>
   );
 }
