@@ -3,7 +3,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 
-import { ChamberSeats, DEBATE_AGENTS } from "./ChamberSeats";
+import { ChamberSeats } from "./ChamberSeats";
+import { DEBATE_AGENTS } from "./debateAgents";
+import { DebateTranscript } from "./DebateTranscript";
+import type { StoredDebate } from "./debateHistory";
+import { appendDebate, loadDebates } from "./debateHistory";
+import type { Turn } from "./debateTypes";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
@@ -92,23 +97,31 @@ function parseSseBlock(block: string): StreamEvent | null {
   return null;
 }
 
-type Turn = {
-  kind: "primary" | "interjection";
-  agent: string;
-  name: string;
-  turn: number;
-  text: string;
-  reasoning?: string;
-  targetAgent?: string;
-  targetName?: string;
-};
+function previewContext(s: string, max = 52): string {
+  const t = s.trim().replace(/\s+/g, " ");
+  if (t.length <= max) return t || "(empty)";
+  return `${t.slice(0, max)}…`;
+}
+
+function formatSavedAt(iso: string): string {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
 
 export default function DecisionRoomPage() {
   const [context, setContext] = useState("");
   const [model, setModel] = useState(
     () => process.env.NEXT_PUBLIC_DEFAULT_MODEL ?? "stepfun-ai/step-3.5-flash",
   );
-  /** Free-typed seconds; clamped on blur and when starting a run */
   const [sessionDurationInput, setSessionDurationInput] = useState("120");
   const [consensusThreshold, setConsensusThreshold] = useState(3);
   const [enableInterjections, setEnableInterjections] = useState(true);
@@ -135,6 +148,24 @@ export default function DecisionRoomPage() {
   const [flashAgentId, setFlashAgentId] = useState<string | null>(null);
   const flashClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debateScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const [debateHistory, setDebateHistory] = useState<StoredDebate[]>([]);
+  const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
+
+  const runSeq = useRef(0);
+  const savedUpToSeq = useRef(0);
+
+  const lastSessionMeta = useRef({
+    context: "",
+    model: "",
+    session_duration_sec: 120,
+    consensus_threshold: 3,
+    enable_interjections: true,
+  });
+
+  useEffect(() => {
+    setDebateHistory(loadDebates());
+  }, []);
 
   const clearFlashTimer = useCallback(() => {
     if (flashClearRef.current) {
@@ -174,13 +205,73 @@ export default function DecisionRoomPage() {
     return activeMemberId;
   }, [synthesizerActive, flashAgentId, streamingAgentId, activeMemberId]);
 
+  const selectedArchive = useMemo(
+    () => (selectedArchiveId ? debateHistory.find((d) => d.id === selectedArchiveId) : null),
+    [debateHistory, selectedArchiveId],
+  );
+
+  const displayTurns = selectedArchive ? selectedArchive.turns : turns;
+  const displayVoteOptions = selectedArchive ? selectedArchive.voteOptions : voteOptions;
+  const displayVoteTally = selectedArchive ? selectedArchive.voteTally : voteTally;
+  const displayReport = selectedArchive ? selectedArchive.report : report;
+  const displayError = selectedArchive ? selectedArchive.error : error;
   useLayoutEffect(() => {
     const el = debateScrollRef.current;
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
-  }, [turns, error, voteOptions, voteTally, report, runId, currentAgent, debatePhaseOver]);
+  }, [
+    displayTurns,
+    displayError,
+    displayVoteOptions,
+    displayVoteTally,
+    displayReport,
+    runId,
+    currentAgent,
+    debatePhaseOver,
+    selectedArchiveId,
+  ]);
+
+  useEffect(() => {
+    if (running) return;
+    const seq = runSeq.current;
+    if (seq <= savedUpToSeq.current) return;
+    const hasBody =
+      turns.length > 0 || voteTally !== null || report !== null || error !== null;
+    if (!hasBody) {
+      savedUpToSeq.current = seq;
+      return;
+    }
+    savedUpToSeq.current = seq;
+    const entry: StoredDebate = {
+      id: crypto.randomUUID(),
+      savedAt: new Date().toISOString(),
+      context: lastSessionMeta.current.context,
+      model: lastSessionMeta.current.model,
+      session_duration_sec: lastSessionMeta.current.session_duration_sec,
+      consensus_threshold: lastSessionMeta.current.consensus_threshold,
+      enable_interjections: lastSessionMeta.current.enable_interjections,
+      turns,
+      voteOptions,
+      voteTally: voteTally
+        ? {
+            tallies: voteTally.tallies,
+            votes: voteTally.votes,
+            consensus_reached: voteTally.consensus_reached,
+            winning_option_id: voteTally.winning_option_id,
+            winning_title: voteTally.winning_title,
+            threshold: voteTally.threshold,
+          }
+        : null,
+      report,
+      error,
+    };
+    appendDebate(entry);
+    setDebateHistory(loadDebates());
+  }, [running, turns, voteTally, report, voteOptions, error]);
 
   const runDebate = useCallback(async () => {
+    runSeq.current += 1;
+    setSelectedArchiveId(null);
     setRunning(true);
     setError(null);
     setTurns([]);
@@ -196,6 +287,20 @@ export default function DecisionRoomPage() {
     clearFlashTimer();
     setNowMs(Date.now());
 
+    const sessionDur = (() => {
+      const n = parseInt(sessionDurationInput.replace(/\D/g, ""), 10);
+      if (!Number.isFinite(n)) return 120;
+      return Math.min(600, Math.max(60, n));
+    })();
+
+    lastSessionMeta.current = {
+      context,
+      model,
+      session_duration_sec: sessionDur,
+      consensus_threshold: consensusThreshold,
+      enable_interjections: enableInterjections,
+    };
+
     try {
       const res = await fetch(`${API_URL}/debate/stream`, {
         method: "POST",
@@ -203,11 +308,7 @@ export default function DecisionRoomPage() {
         body: JSON.stringify({
           context,
           model,
-          session_duration_sec: (() => {
-            const n = parseInt(sessionDurationInput.replace(/\D/g, ""), 10);
-            if (!Number.isFinite(n)) return 120;
-            return Math.min(600, Math.max(60, n));
-          })(),
+          session_duration_sec: sessionDur,
           consensus_threshold: consensusThreshold,
           enable_interjections: enableInterjections,
         }),
@@ -373,7 +474,7 @@ export default function DecisionRoomPage() {
   ]);
 
   return (
-    <main className="mx-auto box-border flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-4 overflow-hidden p-6">
+    <main className="mx-auto box-border flex min-h-0 w-full max-w-[min(100%,92rem)] flex-1 flex-col gap-4 overflow-y-auto p-6">
       <header className="shrink-0 flex flex-col gap-3 border-b border-white/10 pb-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Decision Room</h1>
@@ -387,268 +488,193 @@ export default function DecisionRoomPage() {
         </Link>
       </header>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row lg:items-stretch lg:gap-6">
-        <aside className="order-1 flex min-h-0 min-w-0 flex-[1.15] flex-col overflow-y-auto lg:order-1">
+      {/* Mobile: chamber → history → form → debate. Desktop: chamber+timer | history; debate | form */}
+      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_minmax(320px,440px)] lg:grid-rows-[auto_minmax(0,1fr)] lg:gap-6">
+        {/* Row 1 col 1 — Chamber + debate-phase timer bottom-right */}
+        <aside className="order-1 flex min-h-0 min-w-0 flex-col lg:col-start-1 lg:row-start-1">
           <ChamberSeats
             synthesizerActive={synthesizerActive}
             agentHighlightId={agentHighlightId}
+            bottomRight={
+              running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver ? (
+                <div
+                  className="rounded-lg border border-white/15 bg-[var(--background)]/95 px-2.5 py-2 text-left shadow-lg backdrop-blur-sm"
+                  aria-live="polite"
+                >
+                  <p className="text-[9px] font-medium uppercase tracking-wide text-[var(--muted)]">
+                    Debate phase
+                  </p>
+                  <p className="mt-1 text-[11px] leading-snug text-[var(--muted)] sm:text-xs">
+                    <span className="font-semibold tabular-nums text-[var(--foreground)]">
+                      {debateSecondsLeft}s
+                    </span>{" "}
+                    left · {sessionClock.session_duration_sec}s session · {sessionClock.synth_reserve_sec}s closing
+                  </p>
+                </div>
+              ) : undefined
+            }
           />
         </aside>
 
-        <div className="order-2 flex min-h-0 w-full min-w-0 flex-1 flex-col gap-4 lg:order-2 lg:h-full lg:w-[420px] lg:max-w-[420px] lg:shrink-0 lg:flex-none">
-          <section className="shrink-0 flex flex-col gap-4 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
-      <label className="flex flex-col gap-2">
-        <span className="text-sm font-medium">Context</span>
-        <textarea
-          className="min-h-[140px] rounded-lg border border-white/10 bg-[var(--card)] p-3 text-sm outline-none ring-[var(--accent)] focus:ring-2"
-          placeholder="Describe the decision, constraints, and what a good outcome looks like…"
-          value={context}
-          onChange={(e) => setContext(e.target.value)}
-          disabled={running}
-        />
-      </label>
-
-      {running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver && (
-        <p className="text-xs text-[var(--muted)]">
-          Debate segment: ~<span className="text-[var(--foreground)]">{debateSecondsLeft}s</span> left (session{" "}
-          {sessionClock.session_duration_sec}s; last {sessionClock.synth_reserve_sec}s for synthesizer)
-        </p>
-      )}
-
-      <div className="flex flex-wrap items-end gap-4">
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-[var(--muted)]">Model</span>
-          <input
-            className="rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            disabled={running}
-          />
-        </label>
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-[var(--muted)]">Session (sec)</span>
-          <input
-            type="text"
-            inputMode="numeric"
-            autoComplete="off"
-            className="w-24 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-            value={sessionDurationInput}
-            onChange={(e) => {
-              const raw = e.target.value.replace(/\D/g, "");
-              setSessionDurationInput(raw);
-            }}
-            onBlur={() => {
-              if (sessionDurationInput === "") {
-                setSessionDurationInput("120");
-                return;
-              }
-              const n = parseInt(sessionDurationInput, 10);
-              const clamped = Number.isFinite(n)
-                ? Math.min(600, Math.max(60, n))
-                : 120;
-              setSessionDurationInput(String(clamped));
-            }}
-            disabled={running}
-          />
-        </label>
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-[var(--muted)]">Consensus (votes)</span>
-          <input
-            type="number"
-            min={1}
-            max={DEBATE_AGENTS.length}
-            className="w-20 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-            value={consensusThreshold}
-            onChange={(e) => setConsensusThreshold(Number(e.target.value) || 3)}
-            disabled={running}
-          />
-        </label>
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="rounded border-white/20"
-            checked={enableInterjections}
-            onChange={(e) => setEnableInterjections(e.target.checked)}
-            disabled={running}
-          />
-          <span className="text-[var(--muted)]">Parallel interjections</span>
-        </label>
-        <button
-          type="button"
-          onClick={runDebate}
-          disabled={!canRun}
-          className="w-fit rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+        {/* Row 1 col 2 — History (wider panel) */}
+        <section
+          className="order-2 flex max-h-40 min-h-0 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-2 lg:row-start-1 lg:max-h-none lg:min-h-0 lg:self-stretch"
+          aria-label="Saved debates"
         >
-          {running ? "Running…" : "Run debate"}
-        </button>
-      </div>
-          </section>
-
-          <section
-            className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30"
-            aria-label="Session output: status, debate, votes, report"
-          >
-            <div
-              ref={debateScrollRef}
-              className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [scrollbar-gutter:stable]"
-            >
-      {error && (
-        <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
-          {error}
-        </p>
-      )}
-
-      {currentAgent && (
-        <p className="text-xs text-[var(--muted)]">
-          Now:{" "}
-          {typeof currentAgent.turn === "number" && (
-            <span className="text-[var(--foreground)]">Turn {currentAgent.turn} · </span>
-          )}
-          <span className="text-[var(--foreground)]">{currentAgent.name}</span>
-          {currentAgent.id === "synthesizer" && " — writing final report…"}
-        </p>
-      )}
-
-      {voteOptions && voteOptions.length > 0 && (
-        <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">Vote options</h2>
-          <ul className="mt-2 flex flex-col gap-1 text-sm text-[var(--muted)]">
-            {voteOptions.map((o) => (
-              <li key={o.id}>
-                <span className="font-mono text-[var(--accent)]">{o.id}</span>: {o.title}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      <section className="flex flex-col gap-4">
-        <h2 className="text-sm font-medium text-[var(--muted)]">Debate</h2>
-        <div className="flex flex-col gap-4">
-          {turns.map((t, idx) => (
-            <div key={`${t.turn}-${idx}-${t.agent}`}>
-              {(idx === 0 || turns[idx - 1].turn !== t.turn) && (
-                <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
-                  Turn {t.turn}
-                </h3>
-              )}
-              <article
-                className={
-                  t.kind === "interjection"
-                    ? "rounded-lg border border-amber-500/40 bg-amber-950/20 p-4"
-                    : "rounded-lg border border-white/10 bg-[var(--card)] p-4"
-                }
+          <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">History</h2>
+            {selectedArchiveId !== null && (
+              <button
+                type="button"
+                onClick={() => setSelectedArchiveId(null)}
+                className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-[var(--accent)] hover:bg-white/5"
               >
-                <h4 className="text-sm font-semibold text-[var(--accent)]">{t.name}</h4>
-                {t.kind === "interjection" && t.targetName && (
-                  <p className="mt-1 text-xs text-amber-200/90">
-                    Interjects to <span className="font-medium">{t.targetName}</span>
+                Live
+              </button>
+            )}
+          </div>
+          <nav className="min-h-0 flex-1 overflow-x-auto overflow-y-auto px-2 py-2 lg:px-3">
+            <ul className="flex flex-row gap-2 lg:flex-col lg:gap-1.5">
+              {debateHistory.map((d) => (
+                <li key={d.id} className="max-w-[200px] shrink-0 lg:max-w-none">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedArchiveId(d.id)}
+                    className={`w-full rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
+                      selectedArchiveId === d.id
+                        ? "bg-[var(--accent)]/20 text-[var(--foreground)]"
+                        : "text-[var(--muted)] hover:bg-white/5 hover:text-[var(--foreground)]"
+                    }`}
+                  >
+                    <span className="block text-[10px] uppercase tracking-wide text-[var(--muted)]">
+                      {formatSavedAt(d.savedAt)}
+                    </span>
+                    <span className="mt-0.5 line-clamp-2 break-words leading-snug">
+                      {previewContext(d.context, 72)}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        </section>
+
+        {/* Row 2 col 1 — Debate transcript (full width of column) */}
+        <section
+          className="order-4 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-1 lg:row-start-2"
+          aria-label="Debate transcript"
+        >
+          <DebateTranscript
+            error={displayError}
+            currentAgent={selectedArchive ? null : currentAgent}
+            running={selectedArchive ? false : running}
+            turns={displayTurns}
+            voteOptions={displayVoteOptions}
+            voteTally={displayVoteTally}
+            report={displayReport}
+            runId={selectedArchive ? null : runId}
+            debateScrollRef={debateScrollRef}
+          />
+        </section>
+
+        {/* Row 2 col 2 — Context & controls */}
+        <section className="order-3 flex min-h-0 flex-col gap-4 lg:col-start-2 lg:row-start-2">
+          <div className="flex shrink-0 flex-col gap-3 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-sm font-medium">Context</span>
+              <textarea
+                rows={4}
+                className="min-h-[5.5rem] w-full resize-y rounded-lg border border-white/10 bg-[var(--card)] p-2.5 text-sm outline-none ring-[var(--accent)] focus:ring-2"
+                placeholder="Describe the decision, constraints, and what a good outcome looks like…"
+                value={context}
+                onChange={(e) => setContext(e.target.value)}
+                disabled={running}
+              />
+            </label>
+
+            <div className="flex flex-wrap items-end gap-4">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-[var(--muted)]">Model</span>
+                <input
+                  className="rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  disabled={running}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-[var(--muted)]">Session (sec)</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  className="w-24 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
+                  value={sessionDurationInput}
+                  onChange={(e) => {
+                    const raw = e.target.value.replace(/\D/g, "");
+                    setSessionDurationInput(raw);
+                  }}
+                  onBlur={() => {
+                    if (sessionDurationInput === "") {
+                      setSessionDurationInput("120");
+                      return;
+                    }
+                    const n = parseInt(sessionDurationInput, 10);
+                    const clamped = Number.isFinite(n)
+                      ? Math.min(600, Math.max(60, n))
+                      : 120;
+                    setSessionDurationInput(String(clamped));
+                  }}
+                  disabled={running}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-[var(--muted)]">Consensus (votes)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={DEBATE_AGENTS.length}
+                  className="w-20 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
+                  value={consensusThreshold}
+                  onChange={(e) => setConsensusThreshold(Number(e.target.value) || 3)}
+                  disabled={running}
+                />
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="rounded border-white/20"
+                  checked={enableInterjections}
+                  onChange={(e) => setEnableInterjections(e.target.checked)}
+                  disabled={running}
+                />
+                <span className="text-[var(--muted)]">Parallel interjections</span>
+              </label>
+              <div className="flex flex-col gap-1">
+                <button
+                  type="button"
+                  onClick={runDebate}
+                  disabled={!canRun}
+                  title={
+                    context.trim().length < 10
+                      ? "Add at least 10 characters in Context"
+                      : running
+                        ? "Debate in progress"
+                        : "Start debate"
+                  }
+                  className="w-fit rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+                >
+                  {running ? "Running…" : "Run debate"}
+                </button>
+                {context.trim().length < 10 && !running && (
+                  <p className="max-w-full text-[11px] text-amber-200/90">
+                    Type at least 10 characters in Context to enable Run.
                   </p>
                 )}
-                {t.reasoning && t.reasoning.length > 0 && (
-                  <details className="mt-2 text-xs">
-                    <summary className="cursor-pointer text-[var(--muted)] hover:text-[var(--foreground)]">
-                      Model reasoning (thinking)
-                    </summary>
-                    <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-md border border-white/5 bg-black/20 p-2 text-[var(--muted)]">
-                      {t.reasoning}
-                    </pre>
-                  </details>
-                )}
-                <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed">{t.text}</p>
-              </article>
+              </div>
             </div>
-          ))}
-        </div>
-      </section>
-
-      {voteTally && (
-        <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">Vote tally</h2>
-          <p className="mt-2 text-sm text-[var(--muted)]">
-            Threshold: at least <strong className="text-[var(--foreground)]">{voteTally.threshold}</strong> of{" "}
-            {DEBATE_AGENTS.length} on one option.
-            {voteTally.consensus_reached ? (
-              <span className="ml-2 text-green-400">Consensus reached.</span>
-            ) : (
-              <span className="ml-2 text-amber-400">No single-option majority at threshold.</span>
-            )}
-          </p>
-          {voteTally.winning_option_id != null && voteTally.consensus_reached && (
-            <p className="mt-1 text-sm">
-              Winner:{" "}
-              <span className="font-medium text-[var(--foreground)]">
-                {voteTally.winning_title || `option ${voteTally.winning_option_id}`}
-              </span>
-            </p>
-          )}
-          <ul className="mt-3 flex flex-wrap gap-3 text-sm">
-            {Object.entries(voteTally.tallies).map(([id, n]) => (
-              <li
-                key={id}
-                className="rounded-md border border-white/10 px-3 py-1 font-mono text-[var(--muted)]"
-              >
-                {id}: {n}
-              </li>
-            ))}
-          </ul>
-          <ul className="mt-3 flex flex-col gap-2 border-t border-white/10 pt-3 text-sm text-[var(--muted)]">
-            {voteTally.votes.map((v) => (
-              <li key={v.agent_id}>
-                <span className="text-[var(--foreground)]">{v.name}</span> →{" "}
-                <span className="font-mono text-[var(--accent)]">{v.option_id}</span>
-                {v.rationale ? ` — ${v.rationale}` : null}
-              </li>
-            ))}
-          </ul>
+          </div>
         </section>
-      )}
-
-      {report && (
-        <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">Chief Synthesizer — report</h2>
-          <p className="mt-3 text-sm leading-relaxed">{report.summary}</p>
-          <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-            Ranked options
-          </h3>
-          <ul className="mt-2 flex flex-col gap-2">
-            {report.ranked_options.map((o) => (
-              <li key={o.title} className="rounded-md border border-white/5 p-3 text-sm">
-                <div className="flex justify-between gap-2">
-                  <span className="font-medium">{o.title}</span>
-                  <span className="text-[var(--muted)]">
-                    {(o.score * 100).toFixed(0)}%
-                  </span>
-                </div>
-                <p className="mt-1 text-[var(--muted)]">{o.rationale}</p>
-              </li>
-            ))}
-          </ul>
-          <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-            Risks
-          </h3>
-          <ul className="mt-1 list-inside list-disc text-sm text-[var(--muted)]">
-            {report.risks.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
-          <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-            Next steps
-          </h3>
-          <ul className="mt-1 list-inside list-decimal text-sm">
-            {report.next_steps.map((s) => (
-              <li key={s}>{s}</li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {runId !== null && (
-        <p className="text-xs text-[var(--muted)]">Saved as run #{runId}</p>
-      )}
-            </div>
-          </section>
-        </div>
       </div>
     </main>
   );

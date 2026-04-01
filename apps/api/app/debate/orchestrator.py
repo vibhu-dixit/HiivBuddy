@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import random
 import re
 import time
@@ -18,12 +19,15 @@ from app.debate.schemas import (
     ClosingVoteItem,
     FinalReport,
     RankedOption,
+    SYNTH_API_TIMEOUT_SEC,
     SYNTH_RESERVE_SEC,
     VoteOptionItem,
     VoteOptionsResponse,
 )
 from app.llm.client import Settings
 from app.llm.messages import prepare_chat_messages
+
+logger = logging.getLogger(__name__)
 
 
 def _synth_raw_from_assistant_message(msg: Any) -> str:
@@ -755,6 +759,15 @@ async def run_debate_stream(
     )
     synth_kw = _completion_kw_for_messages(base_kw, synth_msgs, llm, 4096)
 
+    win_title = id_to_title.get(winning_option_id or "", "Options")
+    base_ranked = [
+        RankedOption(
+            title=win_title,
+            score=0.5,
+            rationale="Fallback while the full report was unavailable.",
+        )
+    ]
+
     try:
         resp = await asyncio.wait_for(
             client.chat.completions.create(
@@ -763,23 +776,48 @@ async def run_debate_stream(
                 messages=synth_msgs,
                 **synth_kw,
             ),
-            timeout=float(SYNTH_RESERVE_SEC),
+            timeout=float(SYNTH_API_TIMEOUT_SEC),
         )
-        msg = resp.choices[0].message
-        raw = _synth_raw_from_assistant_message(msg)
-        report = _parse_final_report(raw)
-    except (asyncio.TimeoutError, Exception):
+    except asyncio.TimeoutError:
         report = FinalReport(
-            summary="The Chief Synthesizer could not finish within the reserved time window; see transcript and votes above.",
-            ranked_options=[
-                RankedOption(
-                    title=id_to_title.get(winning_option_id or "", "Options"),
-                    score=0.5,
-                    rationale="Fallback after timeout or error.",
-                )
+            summary=(
+                "The Chief Synthesizer hit the server time limit while generating the report. "
+                "Votes and transcript above are still valid."
+            ),
+            ranked_options=base_ranked,
+            risks=[
+                "Structured report timed out—use the vote tally and transcript as the source of truth."
             ],
-            risks=["Synthesis incomplete—review the debate transcript directly."],
-            next_steps=["Re-run with a shorter debate or retry synthesis."],
+            next_steps=[
+                "Retry (or pick a faster model / shorter debate) if this happens often.",
+            ],
         )
+    except Exception:
+        logger.warning("Chief Synthesizer API call failed", exc_info=True)
+        report = FinalReport(
+            summary=(
+                "The Chief Synthesizer request did not complete (API or network error). "
+                "See transcript and votes above."
+            ),
+            ranked_options=base_ranked,
+            risks=["Final narrative unavailable—provider or connectivity may be at fault."],
+            next_steps=["Retry when the API is responsive; check keys and model availability."],
+        )
+    else:
+        try:
+            msg = resp.choices[0].message
+            raw = _synth_raw_from_assistant_message(msg)
+            report = _parse_final_report(raw)
+        except Exception:
+            logger.warning("Chief Synthesizer returned unparseable JSON", exc_info=True)
+            report = FinalReport(
+                summary=(
+                    "The Chief Synthesizer returned output we could not parse into the report format. "
+                    "Use the transcript and votes above."
+                ),
+                ranked_options=base_ranked,
+                risks=["Report JSON was invalid or incomplete—panel discussion remains usable."],
+                next_steps=["Re-run the debate or retry; if it recurs, try another model."],
+            )
 
     yield {"type": "final_report", "report": report.model_dump()}

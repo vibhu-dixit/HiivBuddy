@@ -1,19 +1,12 @@
 "use client";
 
 import Image from "next/image";
+import type { ReactNode } from "react";
 import { useMemo } from "react";
 
-/**
- * Debate agent roster. Ids must match `apps/api/app/debate/orchestrator.py` `AGENTS`.
- * Add rows here when the backend adds advisors — layout reflows automatically.
- */
-export const DEBATE_AGENTS: { id: string; label: string }[] = [
-  { id: "optimist", label: "Optimist" },
-  { id: "devils_advocate", label: "Devil's Advocate" },
-  { id: "data_analyst", label: "Data Analyst" },
-  { id: "risk_guru", label: "Risk Guru" },
-  { id: "ethical_guardian", label: "Ethical Guardian" },
-];
+import { DEBATE_AGENTS } from "./debateAgents";
+
+export { DEBATE_AGENTS };
 
 /** Maximum seats per row; extra agents wrap into balanced rows (e.g. 6 → 3+3, 20 → 5×4). */
 export const DEFAULT_MAX_SEATS_PER_ROW = 5;
@@ -45,6 +38,8 @@ type ChamberSeatsProps = {
   /** Which agent shows the green speaking ring (stream / flash / floor). */
   agentHighlightId: string | null;
   maxSeatsPerRow?: number;
+  /** e.g. debate-phase countdown, anchored bottom-right inside the chamber card */
+  bottomRight?: ReactNode;
 };
 
 /** Light disc behind PNGs so dark marks read on the dark chamber UI. */
@@ -108,6 +103,7 @@ export function ChamberSeats({
   synthesizerActive,
   agentHighlightId,
   maxSeatsPerRow = DEFAULT_MAX_SEATS_PER_ROW,
+  bottomRight,
 }: ChamberSeatsProps) {
   const rows = useMemo(
     () => agentsIntoRows(DEBATE_AGENTS, maxSeatsPerRow),
@@ -116,9 +112,16 @@ export function ChamberSeats({
 
   return (
     <div
-      className="flex min-h-[280px] flex-col rounded-2xl border border-white/10 bg-[var(--card)]/50 p-5"
+      className={`relative flex min-h-[280px] flex-col rounded-2xl border border-white/10 bg-[var(--card)]/50 p-5 ${
+        bottomRight != null ? "pb-14 sm:pb-16" : ""
+      }`}
       aria-label="Chief Synthesizer and advisor seats"
     >
+      {bottomRight != null && (
+        <div className="pointer-events-none absolute bottom-3 right-3 z-10 max-w-[min(100%,18rem)] sm:max-w-[20rem]">
+          <div className="pointer-events-auto">{bottomRight}</div>
+        </div>
+      )}
       <div className="flex justify-center pb-4">
         <AvatarSeat
           src={CHIEF_ICON}

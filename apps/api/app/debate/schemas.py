@@ -1,7 +1,11 @@
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
+# Subtracted from debate time so the session clock leaves room for closing + synthesis.
 SYNTH_RESERVE_SEC = 30
+# Hard limit for the Chief Synthesizer HTTP call only (`asyncio.wait_for`). Separate from
+# SYNTH_RESERVE_SEC: the debate budget uses 30s on the clock; synthesis often needs longer on slow APIs.
+SYNTH_API_TIMEOUT_SEC = 90
 
 
 def _default_chat_model() -> str:
