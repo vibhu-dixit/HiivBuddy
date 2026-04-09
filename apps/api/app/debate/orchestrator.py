@@ -1,6 +1,7 @@
 """Multi-agent debate + vote consensus + Chief Synthesizer. Core product logic."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -12,6 +13,14 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+from app.debate.environment import DebateEnvironment, EnvLimits
+from app.debate.environment_adapter import (
+    apply_classic_interjection,
+    apply_classic_utter,
+    apply_vote_supports,
+    merge_vote_options,
+)
+from app.debate.environment_ops import init_environment, snapshot_for_api
 from app.debate.schemas import (
     AgentStanceItem,
     AgentVoteResponse,
@@ -28,6 +37,13 @@ from app.llm.client import Settings
 from app.llm.messages import prepare_chat_messages
 
 logger = logging.getLogger(__name__)
+
+
+def _debate_environment_seed(context: str, explicit: int | None) -> int:
+    if explicit is not None:
+        return int(explicit) & 0x7FFFFFFF
+    digest = hashlib.sha256(context.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
 def _synth_raw_from_assistant_message(msg: Any) -> str:
@@ -153,8 +169,18 @@ confidence reflects how firm the advisor is; lean summarizes their current recom
 
 
 INTERJECTION_SYSTEM_ADDENDUM = (
-    " When asked for a brief interjection, output only words you would say aloud at the table. "
-    "Never describe your task, instructions, or 'the user'; never plan, preface with 'Okay', or explain what you will do."
+    " Interjection: output ONLY 1–2 sentences you would say aloud—one short paragraph, no title. "
+    "Forbidden: 'We need to respond as', 'Let's reconstruct', 'The user', role instructions, or quoting the prompt. "
+    "If nothing to add, output exactly PASS alone."
+)
+
+# Primary turns: models (esp. with chain-of-thought) often paraphrase the user prompt or plan aloud.
+PRIMARY_DEBATE_SYSTEM_ADDENDUM = (
+    " You are speaking aloud at a conference table, not writing an essay or a rubric. "
+    "Output ONLY what you would say in one breath: at most three sentences, no bullets. "
+    "Do not plan, outline, or say what you will argue. Do not quote or restate the moderator instructions. "
+    "Do not preface with meta like 'We need to', 'I'll pick', 'Probably', 'Given that', or 'As [role], we could'. "
+    "Start directly with your substance; if you address another advisor, use their role name naturally (e.g. 'Optimist, …')."
 )
 
 
@@ -183,22 +209,162 @@ def _paragraph_is_instruction_leak(p: str) -> bool:
         "given the instructions",
         "as an ai",
         "as a language model",
+        "the user request",
+        "user request:",
+        "you are the optimist",
+        "you are the devil's advocate",
+        "you are the data analyst",
+        "you are the risk guru",
+        "you are the ethical guardian",
+        "highlight upside, opportunities",
+        "challenge assumptions",
     )
     return any(s in pl for s in leaks)
 
 
-def _strip_interjection_meta(text: str) -> str:
-    """Remove leading meta paragraphs/lines so only in-character speech remains."""
-    t = (text or "").strip()
+def _paragraph_is_planning_meta(p: str) -> bool:
+    """Heuristic: rubric / planning / prompt echo — not spoken dialogue."""
+    pl = p.lower().strip()
+    if not pl:
+        return False
+    if _paragraph_is_instruction_leak(p):
+        return True
+    needles = (
+        "we are we",
+        "we need to pick",
+        "we need to respond",
+        "we need to respond as",
+        "we need to choose",
+        "we need to decide",
+        "we need to speak",
+        "respond as ",
+        "to respond as ",
+        "pick a participant",
+        "don't have optimist",
+        "don't have devil's",
+        "don't have ethical",
+        "no optimist's actual",
+        "infer they'd",
+        "infer they would",
+        "as they'd be speaking",
+        "speaking now (turn",
+        "presumably would argue",
+        "we could respond to",
+        "we'll disagree",
+        "we'll agree",
+        "probably optimist",
+        "probably the optimist",
+        "probably devil's",
+        "let's consider context:",
+        "let's reconstruct",
+        "initial context:",
+        "that's one sentence",
+        "that's two sentence",
+        "make sure no bullet",
+        "above is how",
+        "thus, we could say",
+        "thus we could say",
+        "so we could say:",
+        "consider:",
+        "do we agree, disagree",
+        "we should speak only",
+        "otherwise pass",
+        "as dialogue only",
+        "reply with exactly pass",
+        "reply with exactly",
+        "interjects →",
+        "for some reason they",
+        "they echoed",
+        "weird placeholder",
+        "data analyst might add",
+        "[turn ",
+        "actually turn ",
+    )
+    return any(n in pl for n in needles)
+
+
+def _strip_transcript_artifacts(text: str) -> str:
+    """Remove pasted transcript markers some models echo into content."""
+    t = text or ""
+    t = re.sub(r"\[Turn\s*\d+\]\s*\[[^\]\n]{1,120}\]:\s*", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
+def _salvage_quoted_speech(text: str) -> str | None:
+    """Use longest quoted span that looks like real table speech, not rubric."""
+    best: str | None = None
+    for m in re.finditer(r'"([^"]{18,800})"', text or "", re.DOTALL):
+        inner = " ".join(m.group(1).strip().split())
+        if not inner or _text_still_meta_ridden(inner) or _paragraph_is_planning_meta(inner):
+            continue
+        if best is None or len(inner) > len(best):
+            best = inner
+    return best
+
+
+def _text_still_meta_ridden(text: str) -> bool:
+    """True if stripped text is still mostly rubric (drop interjection)."""
+    low = (text or "").lower().strip()
+    if not low:
+        return True
+    hard = (
+        "we need to respond as",
+        "we are we",
+        "the user request",
+        "you are the optimist",
+        "let's reconstruct",
+        "initial context:",
+        "[turn ",
+    )
+    return any(h in low for h in hard)
+
+
+def _strip_primary_speech_meta(text: str) -> str:
+    """Drop rubric / planning paragraphs anywhere in main debate turns."""
+    t = _strip_transcript_artifacts((text or "").strip())
     if not t:
         return ""
-    # Split paragraphs; drop ones that read as instruction-following / planning
     paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
-    kept = [p for p in paras if not _paragraph_is_instruction_leak(p)]
+    if not paras:
+        paras = [t]
+    kept = [
+        p
+        for p in paras
+        if not _paragraph_is_planning_meta(p) and not _paragraph_is_instruction_leak(p)
+    ]
+    out = "\n\n".join(kept).strip()
+    if not out:
+        out = _strip_interjection_meta(t)
+    if not out:
+        return ""
+    lines = out.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        if _paragraph_is_planning_meta(line) and len(line) < 500:
+            i += 1
+            continue
+        break
+    return "\n".join(lines[i:]).strip() or out
+
+
+def _strip_interjection_meta(text: str) -> str:
+    """Remove rubric / planning paragraphs and leading junk from interjections."""
+    t = _strip_transcript_artifacts((text or "").strip())
+    if not t:
+        return ""
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
+    kept = [
+        p
+        for p in paras
+        if not _paragraph_is_instruction_leak(p) and not _paragraph_is_planning_meta(p)
+    ]
     out = "\n\n".join(kept).strip()
     if not out:
         return ""
-    # Drop initial lines that still look like setup (single block without \n\n)
     lines = out.splitlines()
     i = 0
     while i < len(lines):
@@ -213,6 +379,9 @@ def _strip_interjection_meta(text: str) -> str:
             i += 1
             continue
         if _paragraph_is_instruction_leak(line) and len(line) < 400:
+            i += 1
+            continue
+        if _paragraph_is_planning_meta(line) and len(line) < 500:
             i += 1
             continue
         break
@@ -260,16 +429,21 @@ async def _interjection_reply(
     turn_index: int,
 ) -> str | None:
     """One advisor responds to the last primary speech; returns None on failure or PASS."""
+    ctx_short = (context or "").strip().replace("\r\n", "\n")
+    if len(ctx_short) > 700:
+        ctx_short = ctx_short[:697].rstrip() + "…"
+    tail = (transcript_tail or "").strip().replace("\r\n", "\n")
+    if len(tail) > 4500:
+        tail = "…\n" + tail[-4500:].lstrip()
+    last_s = (last_text or "").strip()
+    if len(last_s) > 1200:
+        last_s = last_s[:1197].rstrip() + "…"
     user = (
-        f"Decision context:\n{context}\n\n"
-        f"Earlier debate (may be truncated):\n{transcript_tail}\n\n"
-        f"{speaker['name']} just said (Turn {turn_index}):\n\"\"\"\n{last_text}\n\"\"\"\n\n"
-        f"You are {other['name']}, a different advisor at the same table. "
-        "If you disagree, need a correction, or must add a critical fact—say it in at most two short sentences, "
-        "in character, as dialogue only. "
-        "If you agree or have nothing material to add, reply with exactly PASS as the first line and nothing else.\n"
-        f"Do not repeat {speaker['name']}'s points. "
-        "Do not describe your task, the prompt, or what you were asked to do—only speak as you would at the table."
+        f"Situation:\n{ctx_short}\n\n"
+        f"Thread:\n{tail}\n\n"
+        f"{speaker['name']} (just now): {last_s}\n\n"
+        f"You are {other['name']}. In ≤2 spoken sentences, correct or add one fact—or first line only: PASS. "
+        f"No meta. No 'we need to respond as'. Do not repeat {speaker['name']}."
     )
     try:
         resp = await client.chat.completions.create(
@@ -294,9 +468,13 @@ async def _interjection_reply(
         return None
     cleaned = _clean_interjection(raw)
     cleaned = _strip_interjection_meta(cleaned)
+    if _text_still_meta_ridden(cleaned):
+        alt = _salvage_quoted_speech(raw)
+        if alt:
+            cleaned = _trim_to_max_sentences(alt, 2)
     if not cleaned or re.match(r"^(PASS|NO\s*INTERRUPTION)\b", cleaned, re.I):
         return None
-    if _paragraph_is_instruction_leak(cleaned):
+    if _paragraph_is_instruction_leak(cleaned) or _text_still_meta_ridden(cleaned):
         return None
     return cleaned
 
@@ -318,10 +496,12 @@ def _trim_to_max_sentences(text: str, max_sentences: int = 3) -> str:
 
 
 def _primary_debate_kwargs(base_kw: dict[str, Any]) -> dict[str, Any]:
-    """Short replies: cap tokens for ~3 sentences."""
+    """Short replies: cap tokens for ~3 sentences; disable thinking so planning stays out of `content`."""
     out = dict(base_kw)
     cap = min(420, int(out.get("max_tokens", 16384)))
     out["max_tokens"] = cap
+    # NVIDIA-style CoT often leaks into visible `content` or encourages rubric-style answers.
+    out.pop("extra_body", None)
     return out
 
 
@@ -441,143 +621,22 @@ Return ONLY valid JSON: {"options": [{"id":"0","title":"short label"}, ...]}
 Use 2 to 4 options, ids "0","1","2","3" in order. Titles must be mutually distinct and reflect main forks from the debate."""
 
 
-async def run_debate_stream(
+async def run_post_debate_phases(
     client: AsyncOpenAI,
     *,
     context: str,
+    transcript: str,
     model: str,
     llm: Settings,
-    session_duration_sec: int = 120,
-    consensus_threshold: int = 3,
-    enable_interjections: bool = True,
+    consensus_threshold: int,
+    session_env_box: list[DebateEnvironment | None],
+    synth_env_snapshot: bool,
+    effective_track: bool,
 ) -> AsyncIterator[dict[str, Any]]:
+    """Vote extraction, tally, Chief Synthesizer — shared by classic and structured swarm."""
     threshold = max(1, min(5, consensus_threshold))
-    total_sec = max(60, min(600, session_duration_sec))
-    debate_budget_sec = max(0.0, float(total_sec - SYNTH_RESERVE_SEC))
-    t0 = time.monotonic()
-    transcript = ""
     base_kw = llm.common_completion_kwargs()
-    primary_kw = _primary_debate_kwargs(base_kw)
-
-    yield {
-        "type": "session_start",
-        "session_duration_sec": total_sec,
-        "debate_budget_sec": debate_budget_sec,
-        "synth_reserve_sec": SYNTH_RESERVE_SEC,
-    }
-
-    # One shuffle at session start: strict round-robin so every block of N=|AGENTS| turns
-    # includes each advisor exactly once (each speaks once per "lap").
-    n_agents = len(AGENTS)
-    rotation_order = list(AGENTS)
-    random.shuffle(rotation_order)
-    rr = 0
-    turn_index = 0
-    while not _debate_deadline_elapsed(t0, debate_budget_sec):
-        agent = rotation_order[rr % n_agents]
-        rr += 1
-        turn_index += 1
-        yield {
-            "type": "agent_start",
-            "agent": agent["id"],
-            "name": agent["name"],
-            "turn": turn_index,
-        }
-
-        user_content = f"Decision context:\n{context}\n\n"
-        if transcript.strip():
-            user_content += f"Debate so far:\n{transcript}\n"
-        user_content += _timed_debate_user_block(turn_index)
-
-        stream = await client.chat.completions.create(
-            model=model,
-            stream=True,
-            messages=prepare_chat_messages(
-                [
-                    {"role": "system", "content": agent["system"]},
-                    {"role": "user", "content": user_content},
-                ],
-                model,
-                llm,
-            ),
-            **primary_kw,
-        )
-
-        full = ""
-        full_reasoning = ""
-        async for chunk in stream:
-            if not getattr(chunk, "choices", None):
-                continue
-            if len(chunk.choices) == 0 or getattr(chunk.choices[0], "delta", None) is None:
-                continue
-            delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                full_reasoning += reasoning
-                yield {"type": "reasoning_token", "agent": agent["id"], "text": reasoning}
-            if getattr(delta, "content", None) is not None:
-                piece = delta.content or ""
-                full += piece
-                yield {"type": "token", "agent": agent["id"], "text": piece}
-
-        full_trimmed = _trim_to_max_sentences(full, 3)
-        yield {
-            "type": "agent_end",
-            "agent": agent["id"],
-            "turn": turn_index,
-            "full_text": full_trimmed,
-            "reasoning_text": full_reasoning or None,
-        }
-        transcript += f"\n\n[Turn {turn_index}][{agent['name']}]: {full_trimmed}\n"
-
-        if enable_interjections and not _debate_deadline_elapsed(t0, debate_budget_sec):
-            others = [a for a in AGENTS if a["id"] != agent["id"]]
-            ij_kw = _short_interjection_kwargs(base_kw)
-            tail = transcript[-6000:] if len(transcript) > 6000 else transcript
-
-            async def _wrap_interj(
-                other: dict[str, str],
-                *,
-                sp: dict[str, str] = agent,
-                lt: str = full_trimmed,
-                ti: int = turn_index,
-            ) -> tuple[dict[str, str], str | None]:
-                try:
-                    t = await _interjection_reply(
-                        client,
-                        model=model,
-                        kw=ij_kw,
-                        llm=llm,
-                        context=context,
-                        transcript_tail=tail,
-                        speaker=sp,
-                        last_text=lt,
-                        other=other,
-                        turn_index=ti,
-                    )
-                    return (other, t)
-                except Exception:
-                    return (other, None)
-
-            ij_futs = [asyncio.create_task(_wrap_interj(o)) for o in others]
-            for ij_fut in asyncio.as_completed(ij_futs):
-                other, snippet = await ij_fut
-                if not snippet:
-                    continue
-                yield {
-                    "type": "interjection",
-                    "agent": other["id"],
-                    "name": other["name"],
-                    "target_agent": agent["id"],
-                    "target_name": agent["name"],
-                    "turn": turn_index,
-                    "text": snippet,
-                }
-                transcript += (
-                    f"\n[Turn {turn_index}][{other['name']} interjects → {agent['name']}]: {snippet}\n"
-                )
-
-    yield {"type": "debate_phase_end", "turns_completed": turn_index}
+    se = session_env_box[0]
 
     yield {"type": "vote_phase_start"}
 
@@ -688,6 +747,10 @@ async def run_debate_stream(
     yield {"type": "vote_options", "options": opt_payload}
 
     vote_records = _closing_votes_to_records(parsed_closing, allowed_ids)
+    if effective_track and se is not None:
+        se = merge_vote_options(se, list(vote_opts))
+        se = apply_vote_supports(se, vote_records, n_agents=len(AGENTS))
+        session_env_box[0] = se
     stance_trace = _stance_list_to_trace(parsed_closing.agent_stances)
     yield {"type": "agent_decision_trace", "stances": stance_trace}
 
@@ -726,6 +789,18 @@ async def run_debate_stream(
         "threshold": threshold,
     }
 
+    se = session_env_box[0]
+    if effective_track and se is not None:
+        yield {
+            "type": "env_snapshot",
+            "phase": "post_vote",
+            "snapshot": snapshot_for_api(
+                se,
+                max_claim_text_in_snapshot=160,
+                max_edges_in_snapshot=48,
+            ),
+        }
+
     yield {"type": "synthesizer_start"}
 
     vote_summary = json.dumps(
@@ -746,8 +821,19 @@ async def run_debate_stream(
         f"Full debate transcript:\n{transcript}\n\n"
         f"Vote summary (JSON):\n{vote_summary}\n\n"
         f"Agent stance trace (JSON):\n{stance_summary}\n\n"
-        "Produce the final JSON report object now."
     )
+    se = session_env_box[0]
+    if synth_env_snapshot and se is not None:
+        env_snap_txt = json.dumps(
+            snapshot_for_api(
+                se,
+                max_claim_text_in_snapshot=200,
+                max_edges_in_snapshot=64,
+            ),
+            ensure_ascii=False,
+        )
+        synth_user += f"Environment snapshot (JSON):\n{env_snap_txt}\n\n"
+    synth_user += "Produce the final JSON report object now."
 
     synth_msgs = prepare_chat_messages(
         [
@@ -820,4 +906,216 @@ async def run_debate_stream(
                 next_steps=["Re-run the debate or retry; if it recurs, try another model."],
             )
 
-    yield {"type": "final_report", "report": report.model_dump()}
+    se = session_env_box[0]
+    env_snap_final = None
+    if se is not None and (effective_track or synth_env_snapshot):
+        env_snap_final = snapshot_for_api(
+            se,
+            max_claim_text_in_snapshot=200,
+            max_edges_in_snapshot=64,
+        )
+    final_payload: dict[str, Any] = {"type": "final_report", "report": report.model_dump()}
+    if env_snap_final is not None:
+        final_payload["env_snapshot"] = env_snap_final
+    yield final_payload
+
+
+async def run_debate_stream(
+    client: AsyncOpenAI,
+    *,
+    context: str,
+    model: str,
+    llm: Settings,
+    session_duration_sec: int = 120,
+    consensus_threshold: int = 3,
+    enable_interjections: bool = True,
+    track_environment: bool = False,
+    synth_env_snapshot: bool = False,
+    environment_rng_seed: int | None = None,
+    env_limits: EnvLimits | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    total_sec = max(60, min(600, session_duration_sec))
+    debate_budget_sec = max(0.0, float(total_sec - SYNTH_RESERVE_SEC))
+    t0 = time.monotonic()
+    transcript = ""
+    base_kw = llm.common_completion_kwargs()
+    primary_kw = _primary_debate_kwargs(base_kw)
+
+    yield {
+        "type": "session_start",
+        "session_duration_sec": total_sec,
+        "debate_budget_sec": debate_budget_sec,
+        "synth_reserve_sec": SYNTH_RESERVE_SEC,
+    }
+
+    effective_track = track_environment
+    need_env = effective_track or synth_env_snapshot
+    limits = env_limits or EnvLimits()
+    seed = _debate_environment_seed(context, environment_rng_seed)
+    session_env: DebateEnvironment | None
+    if need_env:
+        session_env = init_environment(
+            context,
+            rng_seed=seed,
+            limits=limits,
+            mode="classic",
+        )
+    else:
+        session_env = None
+
+    n_agents = len(AGENTS)
+    rotation_order = list(AGENTS)
+    random.shuffle(rotation_order)
+    rr = 0
+    turn_index = 0
+    while not _debate_deadline_elapsed(t0, debate_budget_sec):
+        agent = rotation_order[rr % n_agents]
+        rr += 1
+        turn_index += 1
+        yield {
+            "type": "agent_start",
+            "agent": agent["id"],
+            "name": agent["name"],
+            "turn": turn_index,
+        }
+
+        user_content = f"Decision context:\n{context}\n\n"
+        if transcript.strip():
+            user_content += f"Debate so far:\n{transcript}\n"
+        user_content += _timed_debate_user_block(turn_index)
+
+        stream = await client.chat.completions.create(
+            model=model,
+            stream=True,
+            messages=prepare_chat_messages(
+                [
+                    {
+                        "role": "system",
+                        "content": f"{agent['system']}{PRIMARY_DEBATE_SYSTEM_ADDENDUM}",
+                    },
+                    {"role": "user", "content": user_content},
+                ],
+                model,
+                llm,
+            ),
+            **primary_kw,
+        )
+
+        full = ""
+        full_reasoning = ""
+        async for chunk in stream:
+            if not getattr(chunk, "choices", None):
+                continue
+            if len(chunk.choices) == 0 or getattr(chunk.choices[0], "delta", None) is None:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                full_reasoning += reasoning
+                yield {"type": "reasoning_token", "agent": agent["id"], "text": reasoning}
+            if getattr(delta, "content", None) is not None:
+                piece = delta.content or ""
+                full += piece
+                yield {"type": "token", "agent": agent["id"], "text": piece}
+
+        cleaned = _strip_primary_speech_meta(full)
+        full_trimmed = _trim_to_max_sentences(cleaned, 3)
+        if _text_still_meta_ridden(full_trimmed) or len(full_trimmed.strip()) < 12:
+            alt = _salvage_quoted_speech(full)
+            if alt:
+                full_trimmed = _trim_to_max_sentences(alt, 3)
+        yield {
+            "type": "agent_end",
+            "agent": agent["id"],
+            "turn": turn_index,
+            "full_text": full_trimmed,
+            "reasoning_text": full_reasoning or None,
+        }
+        transcript += f"\n\n[Turn {turn_index}][{agent['name']}]: {full_trimmed}\n"
+        if effective_track and session_env is not None:
+            session_env = apply_classic_utter(
+                session_env,
+                agent_id=agent["id"],
+                text=full_trimmed,
+                turn_ref=turn_index,
+            )
+
+        if enable_interjections and not _debate_deadline_elapsed(t0, debate_budget_sec):
+            others = [a for a in AGENTS if a["id"] != agent["id"]]
+            ij_kw = _short_interjection_kwargs(base_kw)
+            tail = transcript[-6000:] if len(transcript) > 6000 else transcript
+
+            async def _wrap_interj(
+                other: dict[str, str],
+                *,
+                sp: dict[str, str] = agent,
+                lt: str = full_trimmed,
+                ti: int = turn_index,
+            ) -> tuple[dict[str, str], str | None]:
+                try:
+                    t = await _interjection_reply(
+                        client,
+                        model=model,
+                        kw=ij_kw,
+                        llm=llm,
+                        context=context,
+                        transcript_tail=tail,
+                        speaker=sp,
+                        last_text=lt,
+                        other=other,
+                        turn_index=ti,
+                    )
+                    return (other, t)
+                except Exception:
+                    return (other, None)
+
+            ij_futs = [asyncio.create_task(_wrap_interj(o)) for o in others]
+            for ij_fut in asyncio.as_completed(ij_futs):
+                other, snippet = await ij_fut
+                if not snippet:
+                    continue
+                yield {
+                    "type": "interjection",
+                    "agent": other["id"],
+                    "name": other["name"],
+                    "target_agent": agent["id"],
+                    "target_name": agent["name"],
+                    "turn": turn_index,
+                    "text": snippet,
+                }
+                transcript += (
+                    f"\n[Turn {turn_index}][{other['name']} interjects → {agent['name']}]: {snippet}\n"
+                )
+                if effective_track and session_env is not None:
+                    session_env = apply_classic_interjection(
+                        session_env,
+                        agent_id=other["id"],
+                        text=snippet,
+                        turn_ref=turn_index,
+                    )
+
+    if effective_track and session_env is not None:
+        yield {
+            "type": "env_snapshot",
+            "phase": "debate_end",
+            "snapshot": snapshot_for_api(
+                session_env,
+                max_claim_text_in_snapshot=120,
+                max_edges_in_snapshot=32,
+            ),
+        }
+
+    yield {"type": "debate_phase_end", "turns_completed": turn_index}
+
+    async for ev in run_post_debate_phases(
+        client,
+        context=context,
+        transcript=transcript,
+        model=model,
+        llm=llm,
+        consensus_threshold=consensus_threshold,
+        session_env_box=[session_env],
+        synth_env_snapshot=synth_env_snapshot,
+        effective_track=effective_track,
+    ):
+        yield ev

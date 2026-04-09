@@ -17,6 +17,11 @@ export type StoredDebate = {
   session_duration_sec: number;
   consensus_threshold: number;
   enable_interjections: boolean;
+  session_mode?: "classic" | "swarm";
+  /** @deprecated legacy localStorage entries */
+  debate_mode?: "classic" | "swarm";
+  track_environment?: boolean;
+  synth_env_snapshot?: boolean;
   turns: Turn[];
   voteOptions: { id: string; title: string }[] | null;
   voteTally: StoredVoteTally | null;
@@ -25,6 +30,7 @@ export type StoredDebate = {
     ranked_options: { title: string; score: number; rationale: string }[];
     risks: string[];
     next_steps: string[];
+    env_snapshot?: unknown;
   } | null;
   error: string | null;
 };

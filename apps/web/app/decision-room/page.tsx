@@ -8,9 +8,12 @@ import { DEBATE_AGENTS } from "./debateAgents";
 import { DebateTranscript } from "./DebateTranscript";
 import type { StoredDebate } from "./debateHistory";
 import { appendDebate, loadDebates } from "./debateHistory";
+import { buildSessionMarkdown, downloadMarkdownFile } from "./sessionExportMarkdown";
 import type { Turn } from "./debateTypes";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+/** Must match API `MAX_EXTRACTED_CHARS` in context_ingest.py */
+const MAX_CONTEXT_CHARS = 65536;
 
 type SessionStart = {
   type: "session_start";
@@ -21,7 +24,14 @@ type SessionStart = {
 type AgentStart = { type: "agent_start"; agent: string; name: string; turn?: number };
 type Token = { type: "token"; agent: string; text: string };
 type ReasoningToken = { type: "reasoning_token"; agent: string; text: string };
-type AgentEnd = { type: "agent_end"; agent: string; full_text: string; turn?: number };
+type AgentEnd = {
+  type: "agent_end";
+  agent: string;
+  full_text: string;
+  turn?: number;
+  /** Server-cleaned transcript; replaces streamed tokens so meta/planning is not left visible */
+  reasoning_text?: string | null;
+};
 type InterjectionEvent = {
   type: "interjection";
   agent: string;
@@ -61,9 +71,17 @@ type FinalReport = {
     risks: string[];
     next_steps: string[];
   };
+  env_snapshot?: unknown;
+};
+type EnvSnapshotEvent = {
+  type: "env_snapshot";
+  phase: string;
+  snapshot: unknown;
 };
 type Saved = { type: "saved"; run_id: number };
 type Done = { type: "done"; run_id?: number };
+
+type ReportState = NonNullable<StoredDebate["report"]>;
 
 type StreamEvent =
   | AgentStart
@@ -78,6 +96,7 @@ type StreamEvent =
   | VoteTally
   | SynthesizerStart
   | FinalReport
+  | EnvSnapshotEvent
   | Saved
   | Done
   | { type: string; [k: string]: unknown };
@@ -140,7 +159,14 @@ export default function DecisionRoomPage() {
     synth_reserve_sec: number;
   } | null>(null);
   const [debatePhaseOver, setDebatePhaseOver] = useState(false);
-  const [report, setReport] = useState<FinalReport["report"] | null>(null);
+  const [report, setReport] = useState<ReportState | null>(null);
+  const [sessionMode, setSessionMode] = useState<"classic" | "swarm">("classic");
+  const [trackEnvironment, setTrackEnvironment] = useState(false);
+  const [synthEnvSnapshot, setSynthEnvSnapshot] = useState(false);
+  const [environmentPeek, setEnvironmentPeek] = useState<{
+    phase: string;
+    snapshot: unknown;
+  } | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
   const [voteOptions, setVoteOptions] = useState<VoteOptions["options"] | null>(null);
   const [voteTally, setVoteTally] = useState<VoteTally | null>(null);
@@ -152,6 +178,10 @@ export default function DecisionRoomPage() {
   const [debateHistory, setDebateHistory] = useState<StoredDebate[]>([]);
   const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
 
+  const contextFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [contextFileMessage, setContextFileMessage] = useState<string | null>(null);
+  const [contextAttachMode, setContextAttachMode] = useState<"append" | "replace">("append");
+
   const runSeq = useRef(0);
   const savedUpToSeq = useRef(0);
 
@@ -161,6 +191,9 @@ export default function DecisionRoomPage() {
     session_duration_sec: 120,
     consensus_threshold: 3,
     enable_interjections: true,
+    session_mode: "classic" as "classic" | "swarm",
+    track_environment: false,
+    synth_env_snapshot: false,
   });
 
   useEffect(() => {
@@ -179,6 +212,78 @@ export default function DecisionRoomPage() {
   const canRun = useMemo(
     () => context.trim().length >= 10 && !running,
     [context, running],
+  );
+
+  const applyExtractedContext = useCallback(
+    (text: string, filename: string, truncatedFromServer?: boolean) => {
+      const incoming = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+      let next: string;
+      if (contextAttachMode === "replace") {
+        next = incoming;
+      } else {
+        const sep = `\n\n--- from: ${filename} ---\n\n`;
+        const base = context.trimEnd();
+        next = base ? `${base}${sep}${incoming}` : incoming;
+      }
+      let truncated = Boolean(truncatedFromServer);
+      if (next.length > MAX_CONTEXT_CHARS) {
+        next = next.slice(0, MAX_CONTEXT_CHARS);
+        truncated = true;
+      }
+      setContext(next);
+      setContextFileMessage(
+        truncated
+          ? `Loaded “${filename}”; text truncated to ${MAX_CONTEXT_CHARS.toLocaleString()} characters.`
+          : `Loaded “${filename}”.`,
+      );
+    },
+    [context, contextAttachMode],
+  );
+
+  const onContextFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+      setContextFileMessage(null);
+      const name = file.name || "file";
+      const ext = name.includes(".") ? (name.split(".").pop() ?? "").toLowerCase() : "";
+
+      try {
+        const isPdf =
+          ext === "pdf" ||
+          file.type === "application/pdf" ||
+          file.type === "application/x-pdf";
+        if (isPdf) {
+          const fd = new FormData();
+          fd.append("file", file, name);
+          const res = await fetch(`${API_URL}/context/extract`, { method: "POST", body: fd });
+          if (!res.ok) {
+            const t = await res.text();
+            throw new Error(t || res.statusText);
+          }
+          const data = (await res.json()) as { text: string; truncated?: boolean };
+          applyExtractedContext(data.text, name, data.truncated);
+          return;
+        }
+        const isText =
+          ext === "txt" ||
+          ext === "md" ||
+          ext === "markdown" ||
+          file.type.startsWith("text/") ||
+          (file.type === "application/octet-stream" &&
+            (ext === "txt" || ext === "md" || ext === "markdown"));
+        if (isText) {
+          const text = await file.text();
+          applyExtractedContext(text, name, false);
+          return;
+        }
+        setContextFileMessage("Unsupported file. Use .txt, .md, or .pdf.");
+      } catch (err) {
+        setContextFileMessage(err instanceof Error ? err.message : "Could not read file.");
+      }
+    },
+    [applyExtractedContext],
   );
 
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -215,6 +320,99 @@ export default function DecisionRoomPage() {
   const displayVoteTally = selectedArchive ? selectedArchive.voteTally : voteTally;
   const displayReport = selectedArchive ? selectedArchive.report : report;
   const displayError = selectedArchive ? selectedArchive.error : error;
+
+  const displayEnvironmentPeek = useMemo(() => {
+    if (selectedArchive?.report?.env_snapshot != null) {
+      return {
+        phase: "stored",
+        snapshot: selectedArchive.report.env_snapshot,
+      };
+    }
+    if (selectedArchive) return null;
+    if (report?.env_snapshot != null) {
+      return { phase: "final", snapshot: report.env_snapshot };
+    }
+    return environmentPeek;
+  }, [selectedArchive, report, environmentPeek]);
+
+  const hasExportableBody = useMemo(
+    () =>
+      displayTurns.length > 0 ||
+      displayVoteTally !== null ||
+      displayReport !== null ||
+      Boolean(displayError),
+    [displayTurns.length, displayVoteTally, displayReport, displayError],
+  );
+
+  const canExportMarkdown = useMemo(
+    () => hasExportableBody && (!running || selectedArchiveId !== null),
+    [hasExportableBody, running, selectedArchiveId],
+  );
+
+  const handleExportMarkdown = useCallback(() => {
+    if (selectedArchive) {
+      const md = buildSessionMarkdown({
+        context: selectedArchive.context,
+        model: selectedArchive.model,
+        session_duration_sec: selectedArchive.session_duration_sec,
+        consensus_threshold: selectedArchive.consensus_threshold,
+        enable_interjections: selectedArchive.enable_interjections,
+        session_mode: selectedArchive.session_mode ?? selectedArchive.debate_mode,
+        track_environment: selectedArchive.track_environment,
+        synth_env_snapshot: selectedArchive.synth_env_snapshot,
+        savedAt: selectedArchive.savedAt,
+        turns: selectedArchive.turns,
+        voteOptions: selectedArchive.voteOptions,
+        voteTally: selectedArchive.voteTally,
+        report: selectedArchive.report,
+        error: selectedArchive.error,
+        runId: null,
+      });
+      const safe = selectedArchive.savedAt.slice(0, 19).replace(/[:]/g, "-");
+      downloadMarkdownFile(md, `hiivbuddy-${safe}`);
+      return;
+    }
+    const sessionDur = (() => {
+      const n = parseInt(sessionDurationInput.replace(/\D/g, ""), 10);
+      if (!Number.isFinite(n)) return 120;
+      return Math.min(600, Math.max(60, n));
+    })();
+    const md = buildSessionMarkdown({
+      context,
+      model,
+      session_duration_sec: sessionDur,
+      consensus_threshold: consensusThreshold,
+      enable_interjections: enableInterjections,
+      session_mode: sessionMode,
+      track_environment: trackEnvironment,
+      synth_env_snapshot: synthEnvSnapshot,
+      savedAt: new Date().toISOString(),
+      turns,
+      voteOptions,
+      voteTally,
+      report,
+      error,
+      runId,
+    });
+    downloadMarkdownFile(md, `hiivbuddy-session-${Date.now()}`);
+  }, [
+    selectedArchive,
+    context,
+    model,
+    sessionDurationInput,
+    consensusThreshold,
+    enableInterjections,
+    sessionMode,
+    trackEnvironment,
+    synthEnvSnapshot,
+    turns,
+    voteOptions,
+    voteTally,
+    report,
+    error,
+    runId,
+  ]);
+
   useLayoutEffect(() => {
     const el = debateScrollRef.current;
     if (!el) return;
@@ -229,6 +427,7 @@ export default function DecisionRoomPage() {
     currentAgent,
     debatePhaseOver,
     selectedArchiveId,
+    displayEnvironmentPeek,
   ]);
 
   useEffect(() => {
@@ -250,6 +449,9 @@ export default function DecisionRoomPage() {
       session_duration_sec: lastSessionMeta.current.session_duration_sec,
       consensus_threshold: lastSessionMeta.current.consensus_threshold,
       enable_interjections: lastSessionMeta.current.enable_interjections,
+      session_mode: lastSessionMeta.current.session_mode,
+      track_environment: lastSessionMeta.current.track_environment,
+      synth_env_snapshot: lastSessionMeta.current.synth_env_snapshot,
       turns,
       voteOptions,
       voteTally: voteTally
@@ -282,6 +484,7 @@ export default function DecisionRoomPage() {
     setVoteTally(null);
     setSessionClock(null);
     setDebatePhaseOver(false);
+    setEnvironmentPeek(null);
     setStreamingAgentId(null);
     setFlashAgentId(null);
     clearFlashTimer();
@@ -299,6 +502,9 @@ export default function DecisionRoomPage() {
       session_duration_sec: sessionDur,
       consensus_threshold: consensusThreshold,
       enable_interjections: enableInterjections,
+      session_mode: sessionMode,
+      track_environment: trackEnvironment,
+      synth_env_snapshot: synthEnvSnapshot,
     };
 
     try {
@@ -311,6 +517,9 @@ export default function DecisionRoomPage() {
           session_duration_sec: sessionDur,
           consensus_threshold: consensusThreshold,
           enable_interjections: enableInterjections,
+          session_mode: sessionMode,
+          track_environment: trackEnvironment,
+          synth_env_snapshot: synthEnvSnapshot,
         }),
       });
 
@@ -399,10 +608,31 @@ export default function DecisionRoomPage() {
               });
               break;
             }
-            case "agent_end":
+            case "agent_end": {
+              const e = ev as AgentEnd;
               setCurrentAgent(null);
               setStreamingAgentId(null);
+              if (typeof e.full_text === "string" && e.full_text.length > 0) {
+                setTurns((prev) => {
+                  if (prev.length === 0) return prev;
+                  const next = [...prev];
+                  const last = next[next.length - 1];
+                  if (last.agent === e.agent) {
+                    const r =
+                      typeof e.reasoning_text === "string" && e.reasoning_text.length > 0
+                        ? e.reasoning_text
+                        : "";
+                    next[next.length - 1] = {
+                      ...last,
+                      text: e.full_text,
+                      reasoning: r,
+                    };
+                  }
+                  return next;
+                });
+              }
               break;
+            }
             case "interjection": {
               const e = ev as InterjectionEvent;
               setStreamingAgentId(null);
@@ -432,16 +662,28 @@ export default function DecisionRoomPage() {
             case "vote_tally":
               setVoteTally(ev as VoteTally);
               break;
+            case "env_snapshot": {
+              const e = ev as EnvSnapshotEvent;
+              setEnvironmentPeek({ phase: e.phase, snapshot: e.snapshot });
+              break;
+            }
             case "synthesizer_start":
               setStreamingAgentId(null);
               setFlashAgentId(null);
               clearFlashTimer();
               setCurrentAgent({ id: "synthesizer", name: "Chief Synthesizer" });
               break;
-            case "final_report":
-              setReport((ev as FinalReport).report);
+            case "final_report": {
+              const e = ev as FinalReport;
+              setReport(
+                e.env_snapshot != null
+                  ? { ...e.report, env_snapshot: e.env_snapshot }
+                  : e.report,
+              );
+              setEnvironmentPeek(null);
               setCurrentAgent(null);
               break;
+            }
             case "saved":
               setRunId((ev as Saved).run_id);
               break;
@@ -470,6 +712,9 @@ export default function DecisionRoomPage() {
     sessionDurationInput,
     consensusThreshold,
     enableInterjections,
+    sessionMode,
+    trackEnvironment,
+    synthEnvSnapshot,
     clearFlashTimer,
   ]);
 
@@ -564,6 +809,21 @@ export default function DecisionRoomPage() {
           className="order-4 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-1 lg:row-start-2"
           aria-label="Debate transcript"
         >
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-b border-white/10 px-3 py-2">
+            <button
+              type="button"
+              onClick={handleExportMarkdown}
+              disabled={!canExportMarkdown}
+              title={
+                canExportMarkdown
+                  ? "Download this session as a Markdown file"
+                  : "Run a session or open History to export"
+              }
+              className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Export Markdown
+            </button>
+          </div>
           <DebateTranscript
             error={displayError}
             currentAgent={selectedArchive ? null : currentAgent}
@@ -572,6 +832,7 @@ export default function DecisionRoomPage() {
             voteOptions={displayVoteOptions}
             voteTally={displayVoteTally}
             report={displayReport}
+            environmentPeek={displayEnvironmentPeek}
             runId={selectedArchive ? null : runId}
             debateScrollRef={debateScrollRef}
           />
@@ -580,17 +841,77 @@ export default function DecisionRoomPage() {
         {/* Row 2 col 2 — Context & controls */}
         <section className="order-3 flex min-h-0 flex-col gap-4 lg:col-start-2 lg:row-start-2">
           <div className="flex shrink-0 flex-col gap-3 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
-            <label className="flex w-full flex-col gap-1.5">
-              <span className="text-sm font-medium">Context</span>
+            <div className="flex w-full flex-col gap-2">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span className="text-sm font-medium">Context</span>
+                <span
+                  className={
+                    context.length > MAX_CONTEXT_CHARS * 0.9
+                      ? "text-xs font-medium text-amber-400"
+                      : "text-xs text-[var(--muted)]"
+                  }
+                >
+                  {context.length.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
+                </span>
+              </div>
+              <input
+                ref={contextFileInputRef}
+                type="file"
+                accept=".txt,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf"
+                className="sr-only"
+                aria-label="Attach context file"
+                onChange={onContextFileChange}
+                disabled={running}
+              />
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <button
+                  type="button"
+                  onClick={() => contextFileInputRef.current?.click()}
+                  disabled={running}
+                  className="rounded-lg border border-white/15 px-2.5 py-1.5 font-medium text-[var(--foreground)] hover:bg-white/5 disabled:opacity-40"
+                >
+                  Attach .txt / .md / .pdf
+                </button>
+                <label className="flex cursor-pointer items-center gap-1.5 text-[var(--muted)]">
+                  <input
+                    type="radio"
+                    name="contextAttachMode"
+                    checked={contextAttachMode === "append"}
+                    onChange={() => setContextAttachMode("append")}
+                    disabled={running}
+                    className="border-white/20"
+                  />
+                  Append
+                </label>
+                <label className="flex cursor-pointer items-center gap-1.5 text-[var(--muted)]">
+                  <input
+                    type="radio"
+                    name="contextAttachMode"
+                    checked={contextAttachMode === "replace"}
+                    onChange={() => setContextAttachMode("replace")}
+                    disabled={running}
+                    className="border-white/20"
+                  />
+                  Replace
+                </label>
+              </div>
+              {contextFileMessage ? (
+                <p className="text-xs text-[var(--muted)]">{contextFileMessage}</p>
+              ) : null}
               <textarea
                 rows={4}
                 className="min-h-[5.5rem] w-full resize-y rounded-lg border border-white/10 bg-[var(--card)] p-2.5 text-sm outline-none ring-[var(--accent)] focus:ring-2"
                 placeholder="Describe the decision, constraints, and what a good outcome looks like…"
                 value={context}
-                onChange={(e) => setContext(e.target.value)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setContext(
+                    v.length > MAX_CONTEXT_CHARS ? v.slice(0, MAX_CONTEXT_CHARS) : v,
+                  );
+                }}
                 disabled={running}
               />
-            </label>
+            </div>
 
             <div className="flex flex-wrap items-end gap-4">
               <label className="flex flex-col gap-1">
@@ -649,6 +970,38 @@ export default function DecisionRoomPage() {
                   disabled={running}
                 />
                 <span className="text-[var(--muted)]">Parallel interjections</span>
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-[var(--muted)]">Session mode</span>
+                <select
+                  className="rounded-lg border border-white/10 bg-[var(--card)] px-2 py-1.5 text-sm"
+                  value={sessionMode}
+                  onChange={(e) => setSessionMode(e.target.value === "swarm" ? "swarm" : "classic")}
+                  disabled={running}
+                >
+                  <option value="classic">Classic (streaming lap debate)</option>
+                  <option value="swarm">Swarm (JSON turns + shared env)</option>
+                </select>
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="rounded border-white/20"
+                  checked={trackEnvironment}
+                  onChange={(e) => setTrackEnvironment(e.target.checked)}
+                  disabled={running}
+                />
+                <span className="text-[var(--muted)]">Track environment</span>
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="rounded border-white/20"
+                  checked={synthEnvSnapshot}
+                  onChange={(e) => setSynthEnvSnapshot(e.target.checked)}
+                  disabled={running}
+                />
+                <span className="text-[var(--muted)]">Synthesizer env JSON</span>
               </label>
               <div className="flex flex-col gap-1">
                 <button

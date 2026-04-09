@@ -13,6 +13,7 @@ type Report = {
   ranked_options: { title: string; score: number; rationale: string }[];
   risks: string[];
   next_steps: string[];
+  env_snapshot?: unknown;
 } | null;
 
 type Props = {
@@ -23,6 +24,8 @@ type Props = {
   voteOptions: VoteOpts;
   voteTally: StoredVoteTally | null;
   report: Report;
+  /** Live or final structured environment snapshot from the API */
+  environmentPeek: { phase: string; snapshot: unknown } | null;
   runId: number | null;
   debateScrollRef: RefObject<HTMLDivElement | null>;
 };
@@ -35,6 +38,7 @@ export function DebateTranscript({
   voteOptions,
   voteTally,
   report,
+  environmentPeek,
   runId,
   debateScrollRef,
 }: Props) {
@@ -112,6 +116,21 @@ export function DebateTranscript({
           ))}
         </div>
       </section>
+
+      {environmentPeek && (
+        <section className="rounded-lg border border-violet-500/25 bg-violet-950/15 p-4">
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">Shared environment</h2>
+          <p className="mt-1 text-xs text-[var(--muted)]">Phase: {environmentPeek.phase}</p>
+          <details className="mt-2 text-xs">
+            <summary className="cursor-pointer text-[var(--muted)] hover:text-[var(--foreground)]">
+              Snapshot JSON
+            </summary>
+            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-white/5 bg-black/25 p-2 font-mono text-[11px] text-[var(--muted)]">
+              {JSON.stringify(environmentPeek.snapshot, null, 2)}
+            </pre>
+          </details>
+        </section>
+      )}
 
       {voteTally && (
         <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">

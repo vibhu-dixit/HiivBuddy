@@ -1,0 +1,267 @@
+"""Structured JSON swarm session: observation -> LLM -> apply_action; then shared vote/synth."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import AsyncIterator
+
+import random
+from openai import AsyncOpenAI
+
+from app.debate.environment import EnvLimits
+from app.debate.environment_ops import apply_action, init_environment, snapshot_for_api
+from app.debate.observation import ObservationConfig, build_observation
+from app.debate.orchestrator import (
+    AGENTS,
+    _completion_kw_for_messages,
+    _debate_environment_seed,
+    _synth_raw_from_assistant_message,
+    run_post_debate_phases,
+)
+from app.debate.schemas import SYNTH_RESERVE_SEC
+from app.debate.swarm_scheduler import init_speech_counts, pick_next_agent_swarm
+from app.debate.swarm_schemas import (
+    SWARM_JSON_RULES,
+    SwarmTurnResponse,
+    parse_swarm_turn_response,
+    swarm_response_to_agent_action,
+    transcript_line_for_turn,
+)
+from app.debate.environment import AgentAction, PassAction
+from app.llm.client import Settings
+from app.llm.messages import prepare_chat_messages
+
+logger = logging.getLogger("app.debate.swarm")
+
+
+async def run_swarm_session_stream(
+    client: AsyncOpenAI,
+    *,
+    context: str,
+    model: str,
+    llm: Settings,
+    session_duration_sec: int = 120,
+    consensus_threshold: int = 3,
+    synth_env_snapshot: bool = False,
+    environment_rng_seed: int | None = None,
+    env_limits: EnvLimits | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Swarm with non-streaming JSON turns. Interjections are not used (sequential structured steps).
+    """
+    total_sec = max(60, min(600, session_duration_sec))
+    debate_budget_sec = max(0.0, float(total_sec - SYNTH_RESERVE_SEC))
+    t0 = time.monotonic()
+    transcript = ""
+    base_kw = llm.common_completion_kwargs()
+    effective_track = True
+
+    yield {
+        "type": "session_start",
+        "session_duration_sec": total_sec,
+        "debate_budget_sec": debate_budget_sec,
+        "synth_reserve_sec": SYNTH_RESERVE_SEC,
+    }
+
+    limits = env_limits or EnvLimits()
+    seed = _debate_environment_seed(context, environment_rng_seed)
+    session_env = init_environment(
+        context,
+        rng_seed=seed,
+        limits=limits,
+        mode="swarm",
+    )
+    rng = random.Random(seed)
+    speech_count = init_speech_counts(AGENTS)
+    obs_config = ObservationConfig()
+    turn_index = 0
+
+    while (time.monotonic() - t0) < debate_budget_sec:
+        turn_index += 1
+        agent = pick_next_agent_swarm(AGENTS, rng, speech_count)
+        speech_count[agent["id"]] = speech_count[agent["id"]] + 1
+
+        remaining = int(debate_budget_sec - (time.monotonic() - t0))
+        obs = build_observation(
+            session_env,
+            agent_id=agent["id"],
+            agent_display_name=agent["name"],
+            context_text=context,
+            debate_seconds_remaining=max(0, remaining),
+            config=obs_config,
+        )
+        user_body = json.dumps(obs, ensure_ascii=False) + "\n\nReturn your JSON decision now."
+        sys_content = f"{agent['system']}{SWARM_JSON_RULES}"
+        msgs = prepare_chat_messages(
+            [
+                {"role": "system", "content": sys_content},
+                {"role": "user", "content": user_body},
+            ],
+            model,
+            llm,
+        )
+        kw = _completion_kw_for_messages(base_kw, msgs, llm, 2048)
+
+        t_llm = time.monotonic()
+        parsed: SwarmTurnResponse | None = None
+        retry_count = 0
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=msgs,
+                **kw,
+            )
+            raw0 = _synth_raw_from_assistant_message(resp.choices[0].message)
+            try:
+                parsed = parse_swarm_turn_response(raw0)
+            except Exception as e1:
+                retry_count = 1
+                repair = (
+                    f"Your previous output was invalid: {e1}. "
+                    "Return ONLY one JSON object with a valid \"action\" and required fields."
+                )
+                msgs2 = prepare_chat_messages(
+                    [
+                        {"role": "system", "content": sys_content},
+                        {"role": "user", "content": user_body},
+                        {"role": "user", "content": repair},
+                    ],
+                    model,
+                    llm,
+                )
+                kw2 = _completion_kw_for_messages(base_kw, msgs2, llm, 2048)
+                resp2 = await client.chat.completions.create(
+                    model=model,
+                    response_format={"type": "json_object"},
+                    messages=msgs2,
+                    **kw2,
+                )
+                raw1 = _synth_raw_from_assistant_message(resp2.choices[0].message)
+                try:
+                    parsed = parse_swarm_turn_response(raw1)
+                except Exception as e2:
+                    logger.warning(
+                        "swarm JSON parse failed after retry",
+                        extra={
+                            "session_id": session_env.session_id,
+                            "agent_id": agent["id"],
+                            "turn_idx": turn_index,
+                            "errors": str(e2),
+                            "retry_count": retry_count,
+                        },
+                    )
+                    parsed = None
+        except Exception:
+            logger.warning("swarm LLM call failed", exc_info=True)
+            parsed = None
+
+        latency_ms = (time.monotonic() - t_llm) * 1000.0
+
+        if parsed is None:
+            action: AgentAction = PassAction(agent_id=agent["id"])
+            log_action = "pass"
+        else:
+            try:
+                action = swarm_response_to_agent_action(parsed, agent["id"])
+                log_action = parsed.action
+            except Exception as e:
+                logger.warning(
+                    "swarm map to action failed",
+                    extra={
+                        "session_id": session_env.session_id,
+                        "agent_id": agent["id"],
+                        "turn_idx": turn_index,
+                        "errors": str(e),
+                    },
+                )
+                action = PassAction(agent_id=agent["id"])
+                parsed = SwarmTurnResponse(action="pass")
+                log_action = "pass"
+
+        display_parsed = parsed or SwarmTurnResponse(action="pass")
+        applied_final: AgentAction = action
+
+        result = apply_action(session_env, action)
+        if not result.ok:
+            logger.warning(
+                "swarm apply_action failed; falling back to pass",
+                extra={
+                    "session_id": session_env.session_id,
+                    "agent_id": agent["id"],
+                    "turn_idx": turn_index,
+                    "action": log_action,
+                    "apply_ok": False,
+                    "errors": result.errors,
+                    "latency_ms": round(latency_ms, 1),
+                    "retry_count": retry_count,
+                },
+            )
+            result = apply_action(session_env, PassAction(agent_id=agent["id"]))
+            applied_final = PassAction(agent_id=agent["id"])
+            display_parsed = SwarmTurnResponse(action="pass")
+
+        if not result.ok:
+            logger.error(
+                "swarm pass fallback failed",
+                extra={"session_id": session_env.session_id, "agent_id": agent["id"]},
+            )
+            break
+
+        session_env = result.env
+        line = transcript_line_for_turn(display_parsed, applied_final)
+
+        logger.debug(
+            "swarm turn",
+            extra={
+                "session_id": session_env.session_id,
+                "agent_id": agent["id"],
+                "turn_idx": turn_index,
+                "action": log_action,
+                "apply_ok": True,
+                "latency_ms": round(latency_ms, 1),
+                "retry_count": retry_count,
+            },
+        )
+
+        yield {
+            "type": "agent_start",
+            "agent": agent["id"],
+            "name": agent["name"],
+            "turn": turn_index,
+        }
+        yield {
+            "type": "agent_end",
+            "agent": agent["id"],
+            "turn": turn_index,
+            "full_text": line,
+            "reasoning_text": None,
+        }
+        transcript += f"\n\n[Turn {turn_index}][{agent['name']}]: {line}\n"
+
+    yield {
+        "type": "env_snapshot",
+        "phase": "debate_end",
+        "snapshot": snapshot_for_api(
+            session_env,
+            max_claim_text_in_snapshot=120,
+            max_edges_in_snapshot=32,
+        ),
+    }
+
+    yield {"type": "debate_phase_end", "turns_completed": turn_index}
+
+    async for ev in run_post_debate_phases(
+        client,
+        context=context,
+        transcript=transcript,
+        model=model,
+        llm=llm,
+        consensus_threshold=consensus_threshold,
+        session_env_box=[session_env],
+        synth_env_snapshot=synth_env_snapshot,
+        effective_track=effective_track,
+    ):
+        yield ev

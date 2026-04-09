@@ -2,7 +2,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -12,6 +12,8 @@ from app.db import models  # noqa: F401 — register models before routes
 from app.db.models import DebateRun
 from app.db.session import get_session, init_db
 from app.debate.orchestrator import AGENTS, run_debate_stream
+from app.debate.swarm_runner import run_swarm_session_stream
+from app.context_ingest import extract_text_from_upload
 from app.debate.schemas import DebateRequest
 from app.llm.client import get_async_client, get_settings
 
@@ -43,6 +45,12 @@ async def health():
     return {"status": "ok"}
 
 
+@app.post("/context/extract")
+async def context_extract(file: UploadFile = File(...)):
+    """Extract text from .txt / .md / .pdf for Decision Room context (max 64k chars extracted)."""
+    return await extract_text_from_upload(file)
+
+
 def _format_sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -55,15 +63,41 @@ async def debate_event_stream(
     transcript_parts: list[str] = []
     final_report: dict[str, Any] | None = None
 
-    async for event in run_debate_stream(
-        client,
-        context=body.context,
-        model=body.model,
-        llm=get_settings(),
-        session_duration_sec=body.session_duration_sec,
-        consensus_threshold=body.consensus_threshold,
-        enable_interjections=body.enable_interjections,
-    ):
+    env_limits = body.env_limits.to_env_limits() if body.env_limits else None
+    settings = get_settings()
+    session_mode = body.session_mode
+    if settings.hiivbuddy_force_session_mode in ("classic", "swarm"):
+        session_mode = settings.hiivbuddy_force_session_mode  # type: ignore[assignment]
+
+    stream = (
+        run_swarm_session_stream(
+            client,
+            context=body.context,
+            model=body.model,
+            llm=settings,
+            session_duration_sec=body.session_duration_sec,
+            consensus_threshold=body.consensus_threshold,
+            synth_env_snapshot=body.synth_env_snapshot,
+            environment_rng_seed=body.environment_rng_seed,
+            env_limits=env_limits,
+        )
+        if session_mode == "swarm"
+        else run_debate_stream(
+            client,
+            context=body.context,
+            model=body.model,
+            llm=settings,
+            session_duration_sec=body.session_duration_sec,
+            consensus_threshold=body.consensus_threshold,
+            enable_interjections=body.enable_interjections,
+            track_environment=body.track_environment,
+            synth_env_snapshot=body.synth_env_snapshot,
+            environment_rng_seed=body.environment_rng_seed,
+            env_limits=env_limits,
+        )
+    )
+
+    async for event in stream:
         et = event.get("type")
         if et == "session_start":
             transcript_parts.append(
@@ -121,8 +155,18 @@ async def debate_event_stream(
                     ensure_ascii=False,
                 ),
             )
+        elif et == "env_snapshot":
+            transcript_parts.append(
+                f"--- Environment snapshot ({event.get('phase')}) ---\n"
+                + json.dumps(event.get("snapshot") or {}, ensure_ascii=False),
+            )
         if et == "final_report":
-            final_report = event.get("report")
+            fr = event.get("report")
+            es = event.get("env_snapshot")
+            if isinstance(fr, dict) and es is not None:
+                final_report = {**fr, "env_snapshot": es}
+            else:
+                final_report = fr
         yield _format_sse(event)
 
     row = DebateRun(

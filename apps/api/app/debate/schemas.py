@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Literal
+
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
@@ -12,6 +16,23 @@ def _default_chat_model() -> str:
     from app.llm.client import get_settings
 
     return get_settings().llm_default_model
+
+
+class EnvLimitsPayload(BaseModel):
+    """Caps for in-memory DebateEnvironment; mirrors app.debate.environment.EnvLimits."""
+
+    max_claims: int = Field(default=64, ge=1, le=10_000)
+    max_edges: int = Field(default=128, ge=1, le=50_000)
+    max_steps_per_session: int = Field(default=512, ge=1, le=1_000_000)
+    max_utter_chars: int = Field(default=4000, ge=1, le=100_000)
+    max_claim_text: int = Field(default=2000, ge=1, le=50_000)
+    max_utterances_stored: int = Field(default=50, ge=1, le=500)
+    max_action_log_entries: int = Field(default=40, ge=1, le=500)
+
+    def to_env_limits(self):
+        from app.debate.environment import EnvLimits
+
+        return EnvLimits.model_validate(self.model_dump())
 
 
 class DebateRequest(BaseModel):
@@ -35,6 +56,30 @@ class DebateRequest(BaseModel):
     enable_interjections: bool = Field(
         default=True,
         description="After each main speaker, other advisors may interject in parallel (PASS if no objection)",
+    )
+    session_mode: Literal["classic", "swarm"] = Field(
+        default="classic",
+        validation_alias=AliasChoices("session_mode", "debate_mode"),
+        serialization_alias="session_mode",
+        description="classic: streaming lap debate; swarm: structured JSON turns + shared env",
+    )
+    track_environment: bool = Field(
+        default=False,
+        description="When true, maintain DebateEnvironment during classic debate (utterances + votes)",
+    )
+    synth_env_snapshot: bool = Field(
+        default=False,
+        description="When true, append compact environment JSON to the Chief Synthesizer user message",
+    )
+    environment_rng_seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2_147_483_647,
+        description="Deterministic seed for environment + swarm scheduling; derived from context if null",
+    )
+    env_limits: EnvLimitsPayload | None = Field(
+        default=None,
+        description="Override default DebateEnvironment limits",
     )
 
 

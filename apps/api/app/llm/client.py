@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # Used with estimated prompt size to cap max_tokens (OpenAI-compat: completion + prompt ≤ context).
     # Default 8192 matches many small-context endpoints; set LLM_CONTEXT_TOKENS=131072 (etc.) for long-context models.
     llm_context_tokens: int = Field(default=8192, ge=1024, le=2_000_000)
+    # When "classic" or "swarm", overrides DebateRequest.session_mode (ops safety). "off" = use request.
+    hiivbuddy_force_session_mode: str | None = Field(default=None, alias="HIIVBUDDY_FORCE_SESSION_MODE")
 
     @model_validator(mode="after")
     def _nvidia_defaults_and_key(self):
@@ -63,6 +65,13 @@ class Settings(BaseSettings):
         uses_nvidia = bool(nv) or _looks_like_nvidia_host(self.openai_base_url)
         if self.nvidia_enable_thinking is None:
             self.nvidia_enable_thinking = uses_nvidia
+        fsm = (self.hiivbuddy_force_session_mode or "").strip().lower()
+        if fsm not in ("", "off", "classic", "swarm"):
+            self.hiivbuddy_force_session_mode = None
+        elif fsm in ("", "off"):
+            self.hiivbuddy_force_session_mode = None
+        else:
+            self.hiivbuddy_force_session_mode = fsm
         return self
 
     def resolved_api_key(self) -> str:

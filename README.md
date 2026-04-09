@@ -8,7 +8,7 @@ It’s inspired by “swarm” style thinking: not one chatbot answer, but sever
 
 ## What you get
 
-- **Decision Room** — Paste your context, pick a model (if your provider supports it), and run the flow.
+- **Decision Room** — Paste your context, **attach** `.txt` / `.md` / `.pdf` (PDF text is extracted via the API), pick a model, and run the flow. **Export Markdown** downloads the current or saved session (context, transcript, votes, report).
 - **Timed debate** — You set **session length** (60–600 seconds). The API runs debate until the **debate budget** (`session_duration_sec − 30`) elapses, then runs vote + synthesis. Primary turns are capped at **three sentences**; optional **parallel interjections** after each speaker.
 - **Vote** — The system proposes a few clear options from the debate; each advisor picks one. You’ll see counts and whether a **consensus** threshold was met (default: 3 out of 5).
 - **Final report** — A structured summary: overview, ranked options, risks, suggested next steps.
@@ -95,6 +95,8 @@ npm run dev
 Open **`http://localhost:3000`**, go to **Decision Room**, paste enough context (the app asks for a minimum length), set **session length** (60–600 seconds), then **Run debate**.
 
 **`POST /debate/stream` body (JSON):** `context`, `model`, `session_duration_sec` (60–600), `consensus_threshold` (1–5), `enable_interjections`. The server uses a **monotonic clock**: primary debate runs until **`session_duration_sec − 30`** seconds have passed (checked before each new speaker). The **last 30 seconds** of the chosen duration are reserved on that clock for vote extraction, stance signals, and the **Chief Synthesizer**. The synthesizer HTTP call uses a **separate, longer** server timeout (90s in `SYNTH_API_TIMEOUT_SEC`) so slow endpoints can still return a full JSON report.
+
+**`POST /context/extract` (multipart form-data, field `file`):** Extract plain text from **`.txt`**, **`.md` / `.markdown`**, or **`.pdf`** for use as debate context. Limits: **8 MB** raw file size, **65,536** characters of extracted text (truncated with `truncated: true` in JSON if longer). The Decision Room reads **`.txt` / `.md` in the browser** and sends **PDFs** to this endpoint. The combined context field is capped at **65,536 characters** in the UI to match.
 
 ---
 
