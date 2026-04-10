@@ -612,7 +612,8 @@ export default function DecisionRoomPage() {
               const e = ev as AgentEnd;
               setCurrentAgent(null);
               setStreamingAgentId(null);
-              if (typeof e.full_text === "string" && e.full_text.length > 0) {
+              // Always replace streamed tokens with server-cleaned text (including ""), or raw meta stays visible.
+              if (typeof e.full_text === "string") {
                 setTurns((prev) => {
                   if (prev.length === 0) return prev;
                   const next = [...prev];
@@ -621,7 +622,7 @@ export default function DecisionRoomPage() {
                     const r =
                       typeof e.reasoning_text === "string" && e.reasoning_text.length > 0
                         ? e.reasoning_text
-                        : "";
+                        : last.reasoning ?? "";
                     next[next.length - 1] = {
                       ...last,
                       text: e.full_text,

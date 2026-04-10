@@ -234,6 +234,31 @@ def _paragraph_is_planning_meta(p: str) -> bool:
         "we need to pick",
         "we need to respond",
         "we need to respond as",
+        "we need to output",
+        "we need to produce",
+        "we need to read",
+        "we need to see",
+        "we need to parse",
+        "we need to determine",
+        "we need to identify",
+        "we need to add",
+        "we need to craft",
+        "thus we need",
+        "so we need",
+        "check no meta",
+        "must respond to at least",
+        "must be at most",
+        "must be ≤",
+        "the last instruction",
+        "the last line says",
+        "read the debate so far",
+        "let's parse the conversation",
+        "let's parse",
+        "output as ",
+        "output devil's",
+        "producing ",
+        "model reasoning",
+        "<details",
         "we need to choose",
         "we need to decide",
         "we need to speak",
@@ -468,6 +493,7 @@ async def _interjection_reply(
         return None
     cleaned = _clean_interjection(raw)
     cleaned = _strip_interjection_meta(cleaned)
+    cleaned = _keep_first_non_meta_sentences(cleaned, 2)
     if _text_still_meta_ridden(cleaned):
         alt = _salvage_quoted_speech(raw)
         if alt:
@@ -493,6 +519,79 @@ def _trim_to_max_sentences(text: str, max_sentences: int = 3) -> str:
     if len(parts) <= max_sentences:
         return text.strip()
     return " ".join(parts[:max_sentences]).strip()
+
+
+def _sentence_smells_meta(s: str) -> bool:
+    """Single-sentence check: drop chain-of-thought / rubric lines from streamed content."""
+    t = (s or "").strip()
+    if not t:
+        return True
+    if len(t) > 800 and _paragraph_is_planning_meta(t[:400]):
+        return True
+    if _paragraph_is_instruction_leak(t) or _paragraph_is_planning_meta(t):
+        return True
+    low = t.lower()
+    bad_prefixes = (
+        "we need to output",
+        "we need to produce",
+        "we need to respond as",
+        "we need to read the debate",
+        "we need to read the",
+        "we need to parse",
+        "we need to see what",
+        "we need to determine",
+        "we need to identify",
+        "we need to add",
+        "we need to craft",
+        "we need to understand the situation",
+        "we are to output",
+        "thus we need to",
+        "so we need to",
+        "check no meta",
+        "the last instruction",
+        "the last line says",
+        "let's parse",
+        "let's reconstruct",
+        "read the debate so far",
+        "sentence 1:",
+        "sentence 2:",
+        "must respond to at least",
+        "must be at most three",
+        "must be three sentence",
+        "must be three",
+        "must be ≤",
+    )
+    if any(low.startswith(p) for p in bad_prefixes):
+        return True
+    junk_markers = (
+        "```",
+        "<details",
+        "summary>",
+        "[turn ",
+        "interjects →",
+        "model reasoning",
+        "avoid repeating",
+    )
+    return any(m in low for m in junk_markers)
+
+
+def _keep_first_non_meta_sentences(text: str, max_sentences: int) -> str:
+    """After paragraph stripping, remove leading rubric sentences; keep up to N in-character sentences."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", raw)
+    kept: list[str] = []
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        if _sentence_smells_meta(s):
+            continue
+        kept.append(s)
+        if len(kept) >= max_sentences:
+            break
+    return " ".join(kept).strip()
 
 
 def _primary_debate_kwargs(base_kw: dict[str, Any]) -> dict[str, Any]:
@@ -1018,12 +1117,20 @@ async def run_debate_stream(
                 full += piece
                 yield {"type": "token", "agent": agent["id"], "text": piece}
 
-        cleaned = _strip_primary_speech_meta(full)
-        full_trimmed = _trim_to_max_sentences(cleaned, 3)
+        raw = _strip_transcript_artifacts((full or "").strip())
+        # Sentence-filter the raw stream first — paragraph strip alone drops mixed meta+speech blocks entirely.
+        full_trimmed = _keep_first_non_meta_sentences(raw, 3)
+        if not full_trimmed.strip():
+            full_trimmed = _keep_first_non_meta_sentences(_strip_primary_speech_meta(full), 3)
+        if not full_trimmed.strip():
+            full_trimmed = _trim_to_max_sentences(_strip_primary_speech_meta(full), 3)
+        full_trimmed = _strip_primary_speech_meta(full_trimmed).strip() or full_trimmed.strip()
         if _text_still_meta_ridden(full_trimmed) or len(full_trimmed.strip()) < 12:
             alt = _salvage_quoted_speech(full)
             if alt:
-                full_trimmed = _trim_to_max_sentences(alt, 3)
+                full_trimmed = (
+                    _keep_first_non_meta_sentences(alt, 3) or _trim_to_max_sentences(alt, 3)
+                )
         yield {
             "type": "agent_end",
             "agent": agent["id"],
