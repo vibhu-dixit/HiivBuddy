@@ -1,4 +1,5 @@
 import json
+import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -18,6 +19,22 @@ from app.debate.schemas import DebateRequest
 from app.llm.client import get_async_client, get_settings
 
 
+def _cors_allow_origins() -> list[str]:
+    """Local dev defaults plus comma-separated CORS_ORIGINS (e.g. https://app.vercel.app)."""
+    defaults = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    extra_raw = os.environ.get("CORS_ORIGINS", "").strip()
+    if not extra_raw:
+        return defaults
+    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    seen: set[str] = set()
+    merged: list[str] = []
+    for o in defaults + extra:
+        if o not in seen:
+            seen.add(o)
+            merged.append(o)
+    return merged
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
@@ -30,10 +47,7 @@ app = FastAPI(title="HiivBuddy API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

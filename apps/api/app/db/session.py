@@ -5,7 +5,12 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+_data_dir_env = os.environ.get("HIIVBUDDY_DATA_DIR", "").strip()
+DATA_DIR = (
+    Path(_data_dir_env).resolve()
+    if _data_dir_env
+    else Path(__file__).resolve().parent.parent.parent / "data"
+)
 DB_PATH = DATA_DIR / "hiivbuddy.db"
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH.as_posix()}"
 

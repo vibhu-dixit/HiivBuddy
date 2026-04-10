@@ -135,6 +135,28 @@ Ensure **root** `.env` contains the variables the API needs (see [`.env.example`
 
 ---
 
+## Split deploy: Vercel (web) + free API host
+
+The web app is a standard **Next.js** app under **`apps/web`**; the API is **FastAPI** under **`apps/api`**. Deploy them as two services and point the browser at the API with **`NEXT_PUBLIC_API_URL`**.
+
+### Vercel (frontend)
+
+1. Create a project from this repo and set **Root Directory** to **`apps/web`** (Framework Preset: Next.js).
+2. In **Project → Settings → Environment Variables**, set **`NEXT_PUBLIC_API_URL`** to your public API base URL (HTTPS, **no trailing slash**), e.g. `https://hiivbuddy-api.onrender.com`.
+3. Deploy. Preview deployments get their own `*.vercel.app` URLs; add each origin you use to **`CORS_ORIGINS`** on the API (see below), or use your production Vercel domain only.
+
+### API on Render, Railway, Fly.io, etc.
+
+1. Create a **Web Service** (or equivalent) with **root / working directory** **`apps/api`**.
+2. **Build:** `pip install -r requirements.txt`  
+   **Start:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`  
+   (Or rely on the included **[`apps/api/Procfile`](apps/api/Procfile)** if your host supports it.)
+3. Set the same secrets as local development: **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**, **`LLM_DEFAULT_MODEL`**, and any other variables from [`.env.example`](.env.example).
+4. Set **`CORS_ORIGINS`** to a comma-separated list of allowed browser origins, e.g. `https://your-app.vercel.app,https://www.yourdomain.com`. Local **`http://localhost:3000`** is included by default on the API so you can still develop against a remote API if needed.
+5. **SQLite:** By default the database lives under **`apps/api/data`**. On many free hosts the filesystem is **ephemeral** (data can be lost on redeploy or sleep). For anything beyond demos, attach a **persistent disk** and set **`HIIVBUDDY_DATA_DIR`** to a path on that volume, or move to a managed database later.
+
+---
+
 ## Troubleshooting (plain language)
 
 - **`ENOENT` / `build-manifest.json` under `.next/server/pages/_app`** — Stale or mixed dev/build cache, or Turbopack dev expecting paths that aren’t present. From **`apps/web`**, delete the cache and restart: remove the **`.next`** folder, then run **`npm run dev`** again. Default **`npm run dev`** uses the webpack dev server; use **`npm run dev:turbo`** only if you explicitly want Turbopack.
