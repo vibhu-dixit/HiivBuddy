@@ -7,7 +7,7 @@ import { ChamberSeats } from "./ChamberSeats";
 import { DEBATE_AGENTS } from "./debateAgents";
 import { DebateTranscript } from "./DebateTranscript";
 import type { StoredDebate } from "./debateHistory";
-import { appendDebate, loadDebates } from "./debateHistory";
+import { appendDebate, loadDebates, removeDebate } from "./debateHistory";
 import { buildSessionMarkdown, downloadMarkdownFile } from "./sessionExportMarkdown";
 import type { Turn } from "./debateTypes";
 
@@ -177,6 +177,7 @@ export default function DecisionRoomPage() {
 
   const [debateHistory, setDebateHistory] = useState<StoredDebate[]>([]);
   const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const contextFileInputRef = useRef<HTMLInputElement | null>(null);
   const [contextFileMessage, setContextFileMessage] = useState<string | null>(null);
@@ -184,6 +185,10 @@ export default function DecisionRoomPage() {
 
   const runSeq = useRef(0);
   const savedUpToSeq = useRef(0);
+  /** Set when a run starts; used as localStorage id so we can attach API `run_id` when persisting. */
+  const pendingArchiveIdRef = useRef<string | null>(null);
+  /** Filled on SSE `saved` before the persist effect runs. */
+  const pendingServerRunIdRef = useRef<number | null>(null);
 
   const lastSessionMeta = useRef({
     context: "",
@@ -441,8 +446,11 @@ export default function DecisionRoomPage() {
       return;
     }
     savedUpToSeq.current = seq;
+    const serverRunId = pendingServerRunIdRef.current;
+    pendingServerRunIdRef.current = null;
+    const archiveId = pendingArchiveIdRef.current ?? crypto.randomUUID();
     const entry: StoredDebate = {
-      id: crypto.randomUUID(),
+      id: archiveId,
       savedAt: new Date().toISOString(),
       context: lastSessionMeta.current.context,
       model: lastSessionMeta.current.model,
@@ -452,6 +460,7 @@ export default function DecisionRoomPage() {
       session_mode: lastSessionMeta.current.session_mode,
       track_environment: lastSessionMeta.current.track_environment,
       synth_env_snapshot: lastSessionMeta.current.synth_env_snapshot,
+      ...(typeof serverRunId === "number" ? { run_id: serverRunId } : {}),
       turns,
       voteOptions,
       voteTally: voteTally
@@ -471,8 +480,32 @@ export default function DecisionRoomPage() {
     setDebateHistory(loadDebates());
   }, [running, turns, voteTally, report, voteOptions, error]);
 
+  const handleDeleteArchive = useCallback(
+    async (d: StoredDebate) => {
+      setHistoryError(null);
+      if (typeof d.run_id === "number") {
+        try {
+          const res = await fetch(`${API_URL}/debate/runs/${d.run_id}`, { method: "DELETE" });
+          if (!res.ok && res.status !== 404) {
+            const t = await res.text();
+            throw new Error(t || res.statusText);
+          }
+        } catch (e) {
+          setHistoryError(e instanceof Error ? e.message : "Could not delete saved run on the server.");
+          return;
+        }
+      }
+      removeDebate(d.id);
+      setDebateHistory(loadDebates());
+      setSelectedArchiveId((cur) => (cur === d.id ? null : cur));
+    },
+    [],
+  );
+
   const runDebate = useCallback(async () => {
     runSeq.current += 1;
+    pendingArchiveIdRef.current = crypto.randomUUID();
+    pendingServerRunIdRef.current = null;
     setSelectedArchiveId(null);
     setRunning(true);
     setError(null);
@@ -685,9 +718,12 @@ export default function DecisionRoomPage() {
               setCurrentAgent(null);
               break;
             }
-            case "saved":
-              setRunId((ev as Saved).run_id);
+            case "saved": {
+              const sid = (ev as Saved).run_id;
+              pendingServerRunIdRef.current = sid;
+              setRunId(sid);
               break;
+            }
             case "done": {
               const e = ev as Done;
               if (typeof e.run_id === "number") setRunId(e.run_id);
@@ -779,14 +815,22 @@ export default function DecisionRoomPage() {
               </button>
             )}
           </div>
+          {historyError && (
+            <p className="shrink-0 border-b border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+              {historyError}
+            </p>
+          )}
           <nav className="min-h-0 flex-1 overflow-x-auto overflow-y-auto px-2 py-2 lg:px-3">
             <ul className="flex flex-row gap-2 lg:flex-col lg:gap-1.5">
               {debateHistory.map((d) => (
-                <li key={d.id} className="max-w-[200px] shrink-0 lg:max-w-none">
+                <li
+                  key={d.id}
+                  className="flex max-w-[200px] shrink-0 items-stretch gap-1 lg:max-w-none"
+                >
                   <button
                     type="button"
                     onClick={() => setSelectedArchiveId(d.id)}
-                    className={`w-full rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
+                    className={`min-w-0 flex-1 rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
                       selectedArchiveId === d.id
                         ? "bg-[var(--accent)]/20 text-[var(--foreground)]"
                         : "text-[var(--muted)] hover:bg-white/5 hover:text-[var(--foreground)]"
@@ -798,6 +842,34 @@ export default function DecisionRoomPage() {
                     <span className="mt-0.5 line-clamp-2 break-words leading-snug">
                       {previewContext(d.context, 72)}
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Delete this saved session"
+                    title="Delete from history"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleDeleteArchive(d);
+                    }}
+                    className="shrink-0 rounded-lg px-1.5 text-[var(--muted)] transition-colors hover:bg-red-500/15 hover:text-red-200"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="h-4 w-4"
+                      aria-hidden
+                    >
+                      <path d="M3 6h18" />
+                      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                      <line x1="10" x2="10" y1="11" y2="17" />
+                      <line x1="14" x2="14" y1="11" y2="17" />
+                    </svg>
                   </button>
                 </li>
               ))}

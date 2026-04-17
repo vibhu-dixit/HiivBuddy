@@ -33,6 +33,8 @@ export type StoredDebate = {
     env_snapshot?: unknown;
   } | null;
   error: string | null;
+  /** Server-side SQLite row id when the API persisted this session */
+  run_id?: number;
 };
 
 const STORAGE_KEY = "hiivbuddy-decision-debates-v1";
@@ -61,5 +63,11 @@ export function appendDebate(entry: StoredDebate): void {
   if (typeof window === "undefined") return;
   const prev = loadRaw();
   const next = [entry, ...prev.filter((d) => d.id !== entry.id)].slice(0, MAX_ITEMS);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+}
+
+export function removeDebate(id: string): void {
+  if (typeof window === "undefined") return;
+  const next = loadRaw().filter((d) => d.id !== id);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
 }

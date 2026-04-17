@@ -3,7 +3,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import models  # noqa: F401 — register models before routes
 from app.db.models import DebateRun
-from app.db.session import get_session, init_db
+from app.db.prune import prune_excess_runs
+from app.db.session import async_session_maker, get_session, init_db
 from app.debate.orchestrator import AGENTS, run_debate_stream
 from app.debate.swarm_runner import run_swarm_session_stream
 from app.context_ingest import extract_text_from_upload
@@ -38,6 +39,8 @@ def _cors_allow_origins() -> list[str]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
+    async with async_session_maker() as session:
+        await prune_excess_runs(session)
     yield
 
 
@@ -193,6 +196,8 @@ async def debate_event_stream(
     await session.commit()
     await session.refresh(row)
 
+    await prune_excess_runs(session)
+
     yield _format_sse({"type": "saved", "run_id": row.id})
     yield _format_sse({"type": "done", "run_id": row.id})
 
@@ -229,3 +234,13 @@ async def latest_run(session: AsyncSession = Depends(get_session)):
             "final_report": json.loads(row.final_report_json or "{}"),
         }
     }
+
+
+@app.delete("/debate/runs/{run_id}")
+async def delete_run(run_id: int, session: AsyncSession = Depends(get_session)):
+    row = await session.get(DebateRun, run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    await session.delete(row)
+    await session.commit()
+    return {"ok": True, "deleted": run_id}
