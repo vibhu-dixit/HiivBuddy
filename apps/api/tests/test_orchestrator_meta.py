@@ -3,6 +3,8 @@
 from app.debate.orchestrator import (
     _is_degenerate_repetitive_output,
     _keep_first_non_meta_sentences,
+    _looks_like_moderator_echo,
+    _scrub_transcript_tail_for_prompt,
     _sentence_smells_meta,
 )
 
@@ -46,3 +48,23 @@ def test_degenerate_repetition_detected():
 
 def test_sentence_smells_meta_flags_instruction_echo():
     assert _sentence_smells_meta("We answered: YesWe answered: YesWe answered: Yes")
+
+
+def test_scrub_drops_instruction_echo_lines():
+    blob = (
+        "[Turn 2][Data Analyst]: Tracking hours matters.\n"
+        "Must be in-character, spoken dialogue only.\n"
+        "Risk Guru, the downside is real."
+    )
+    out = _scrub_transcript_tail_for_prompt(blob)
+    assert "Must be in-character" not in out
+    assert "Risk Guru" in out
+
+
+def test_moderator_echo_detected():
+    assert _looks_like_moderator_echo(
+        "Must be in-character, spoken dialogue only. Must agree or disagree."
+    )
+    assert not _looks_like_moderator_echo(
+        "Risk Guru, surveys show most participants exit within a year with net losses."
+    )

@@ -359,6 +359,67 @@ def _is_degenerate_repetitive_output(text: str) -> bool:
     return False
 
 
+_MOD_ECHO_PHRASES_SCRUB = (
+    "must be in-character",
+    "spoken dialogue only",
+    "build on prior turns",
+    "respond to others by name",
+    "stress-test one main argument",
+    "output: at most three sentences",
+    "no meta commentary",
+    "the instruction at the bottom",
+    "we must not restate moderator",
+    "we must not quote prompts",
+    "we need to give initial stance",
+    "i don't have access to the exact text",
+    "i don't have access to",
+    "risk guru (just now): must ",
+    "data analyst (just now): build on",
+    "the user gave a long context",
+)
+
+
+def _scrub_transcript_tail_for_prompt(text: str, *, max_chars: int = 12000) -> str:
+    """Drop lines that are clearly moderator/instruction echoes so later turns do not amplify them."""
+    if not (text or "").strip():
+        return ""
+    banned = tuple(s.lower() for s in _MOD_ECHO_PHRASES_SCRUB)
+    kept: list[str] = []
+    for line in text.splitlines():
+        low = line.strip().lower()
+        if not low:
+            continue
+        if any(b in low for b in banned):
+            continue
+        if low.startswith("we need to ") and any(
+            x in low for x in ("instruction", "output", "respond as", "produce")
+        ):
+            continue
+        kept.append(line.rstrip())
+    out = "\n".join(kept).strip()
+    if len(out) > max_chars:
+        out = "…\n" + out[-max_chars:].lstrip()
+    return out
+
+
+def _looks_like_moderator_echo(text: str) -> bool:
+    """Nemotron-class models often parrot our rules back; treat as non-speech."""
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+    if any(p in low for p in _MOD_ECHO_PHRASES_SCRUB):
+        return True
+    if "must build on" in low and "prior turns" in low and len(low) < 500:
+        return True
+    if low.startswith("we need to give ") and "sentence" in low:
+        return True
+    if "let me think about the" in low and "role" in low and len(low) < 400:
+        return True
+    if "please read the following faq" in low:
+        return True
+    return False
+
+
 def _strip_transcript_artifacts(text: str) -> str:
     """Remove pasted transcript markers some models echo into content."""
     t = text or ""
@@ -513,7 +574,10 @@ async def _interjection_reply(
     ctx_short = (context or "").strip().replace("\r\n", "\n")
     if len(ctx_short) > 700:
         ctx_short = ctx_short[:697].rstrip() + "…"
-    tail = (transcript_tail or "").strip().replace("\r\n", "\n")
+    tail = _scrub_transcript_tail_for_prompt(
+        (transcript_tail or "").strip().replace("\r\n", "\n"),
+        max_chars=4500,
+    )
     if len(tail) > 4500:
         tail = "…\n" + tail[-4500:].lstrip()
     last_s = (last_text or "").strip()
@@ -561,6 +625,8 @@ async def _interjection_reply(
     if _paragraph_is_instruction_leak(cleaned) or _text_still_meta_ridden(cleaned):
         return None
     if _is_degenerate_repetitive_output(cleaned):
+        return None
+    if _looks_like_moderator_echo(cleaned):
         return None
     return cleaned
 
@@ -634,7 +700,19 @@ def _sentence_smells_meta(s: str) -> bool:
         "we answered:",
         "weread more",
     )
-    return any(m in low for m in junk_markers)
+    if any(m in low for m in junk_markers):
+        return True
+    if len(t) < 420:
+        short_echo = (
+            "must be in-character",
+            "spoken dialogue only",
+            "we need to give initial",
+            "must build on prior turns",
+            "the instruction at the bottom",
+        )
+        if any(x in low for x in short_echo):
+            return True
+    return False
 
 
 def _keep_first_non_meta_sentences(text: str, max_sentences: int) -> str:
@@ -1142,7 +1220,7 @@ async def run_debate_stream(
 
         user_content = f"Decision context:\n{context}\n\n"
         if transcript.strip():
-            user_content += f"Debate so far:\n{transcript}\n"
+            user_content += f"Debate so far:\n{_scrub_transcript_tail_for_prompt(transcript)}\n"
         user_content += _timed_debate_user_block(turn_index)
 
         stream = await client.chat.completions.create(
@@ -1203,6 +1281,8 @@ async def run_debate_stream(
                     full_trimmed = _keep_first_non_meta_sentences(q, 3) or _trim_to_max_sentences(q, 3)
         if _is_degenerate_repetitive_output(full_trimmed):
             full_trimmed = ""
+        if _looks_like_moderator_echo(full_trimmed):
+            full_trimmed = ""
         yield {
             "type": "agent_end",
             "agent": agent["id"],
@@ -1222,7 +1302,8 @@ async def run_debate_stream(
         if enable_interjections and not _debate_deadline_elapsed(t0, debate_budget_sec):
             others = [a for a in AGENTS if a["id"] != agent["id"]]
             ij_kw = _short_interjection_kwargs(base_kw)
-            tail = transcript[-6000:] if len(transcript) > 6000 else transcript
+            raw_tail = transcript[-6000:] if len(transcript) > 6000 else transcript
+            tail = _scrub_transcript_tail_for_prompt(raw_tail, max_chars=6000)
 
             async def _wrap_interj(
                 other: dict[str, str],
