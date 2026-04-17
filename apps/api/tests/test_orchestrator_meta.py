@@ -1,6 +1,7 @@
 """Guards against chain-of-thought / rubric text in visible debate lines."""
 
 from app.debate.orchestrator import (
+    _is_degenerate_repetitive_output,
     _keep_first_non_meta_sentences,
     _sentence_smells_meta,
 )
@@ -33,3 +34,15 @@ def test_keep_first_non_meta_interjection_style():
     out = _keep_first_non_meta_sentences(t, 2)
     assert "Check no meta" not in out
     assert "Research shows" in out
+
+
+def test_degenerate_repetition_detected():
+    loop = "We answered: Yes " * 40
+    assert _is_degenerate_repetitive_output(loop)
+    assert not _is_degenerate_repetitive_output(
+        "Risk Guru, surveys show most participants exit within a year with net losses after purchases."
+    )
+
+
+def test_sentence_smells_meta_flags_instruction_echo():
+    assert _sentence_smells_meta("We answered: YesWe answered: YesWe answered: Yes")

@@ -48,12 +48,20 @@ def _debate_environment_seed(context: str, explicit: int | None) -> int:
 
 def _synth_raw_from_assistant_message(msg: Any) -> str:
     """NVIDIA thinking models often return empty `content` and put JSON in `reasoning_content`."""
-    c = msg.content
+
+    def _strip_md_fences(s: str) -> str:
+        t = (s or "").strip()
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t)
+        if m:
+            return m.group(1).strip()
+        return t
+
+    c = getattr(msg, "content", None)
     if isinstance(c, str) and c.strip():
-        return c.strip()
+        return _strip_md_fences(c)
     r = getattr(msg, "reasoning_content", None)
     if isinstance(r, str) and r.strip():
-        return r.strip()
+        return _strip_md_fences(r)
     return "{}"
 
 
@@ -203,6 +211,16 @@ def _paragraph_is_instruction_leak(p: str) -> bool:
         "user wants me",
         "keep it to at most",
         "two short sentences",
+        "in ≤2 spoken",
+        "in at most two spoken sentences",
+        "first line only: pass",
+        "or first line only",
+        "output exactly pass",
+        "reply with pass",
+        "thus we must output",
+        "we answered:",
+        "we answered yes",
+        "the instruction says",
         "avoid repeating their",
         "something material or correct",
         "only add something",
@@ -304,8 +322,41 @@ def _paragraph_is_planning_meta(p: str) -> bool:
         "data analyst might add",
         "[turn ",
         "actually turn ",
+        "looking back at the original problem",
+        "our analysis should cover",
+        "we/new",
+        "故障排序",
+        "机床震",
     )
     return any(n in pl for n in needles)
+
+
+def _is_degenerate_repetitive_output(text: str) -> bool:
+    """True for token loops, template spam, or severe mojibake (some NVIDIA models)."""
+    t = (text or "").strip()
+    if len(t) < 24:
+        return False
+    low = t.lower()
+    if low.count("we answered") >= 3:
+        return True
+    if low.count("answered:") >= 5:
+        return True
+    if low.count("answered answered") >= 2:
+        return True
+    # Repeated bracket / template sludge (common in bad completions)
+    if t.count("Суди") >= 2 or t.count("Sędziowie") >= 2:
+        return True
+    if t.count("�") >= 2 or t.count("\ufffd") >= 2:
+        return True
+    # Same 10–80 char chunk repeated many times (repetition loops)
+    if re.search(r"(.{10,80})\1{2,}", t, flags=re.DOTALL):
+        return True
+    # Extremely low symbol diversity in a long string
+    if len(t) > 200:
+        sample = t[:400]
+        if len(set(sample)) < 18:
+            return True
+    return False
 
 
 def _strip_transcript_artifacts(text: str) -> str:
@@ -340,6 +391,11 @@ def _text_still_meta_ridden(text: str) -> bool:
         "let's reconstruct",
         "initial context:",
         "[turn ",
+        "thus we must output",
+        "the instruction:",
+        "we answered:",
+        "in ≤2 spoken",
+        "first line only: pass",
     )
     return any(h in low for h in hard)
 
@@ -416,7 +472,7 @@ def _strip_interjection_meta(text: str) -> str:
 def _short_interjection_kwargs(base_kw: dict[str, Any]) -> dict[str, Any]:
     """Smaller completions; drop thinking extras so interjections stay quick and on-format."""
     out = dict(base_kw)
-    cap = min(220, int(out.get("max_tokens", 16384)))
+    cap = min(160, int(out.get("max_tokens", 16384)))
     out["max_tokens"] = cap
     out.pop("extra_body", None)
     return out
@@ -467,8 +523,10 @@ async def _interjection_reply(
         f"Situation:\n{ctx_short}\n\n"
         f"Thread:\n{tail}\n\n"
         f"{speaker['name']} (just now): {last_s}\n\n"
-        f"You are {other['name']}. In ≤2 spoken sentences, correct or add one fact—or first line only: PASS. "
-        f"No meta. No 'we need to respond as'. Do not repeat {speaker['name']}."
+        f"You are {other['name']}. In at most two short sentences, add one factual correction or new fact "
+        f"that responds to what they just said—spoken dialogue only. "
+        f"If you have nothing to add, reply with exactly the word PASS on its own line. "
+        f"Do not restate the moderator rules, do not quote prompts, and do not repeat {speaker['name']}'s wording."
     )
     try:
         resp = await client.chat.completions.create(
@@ -501,6 +559,8 @@ async def _interjection_reply(
     if not cleaned or re.match(r"^(PASS|NO\s*INTERRUPTION)\b", cleaned, re.I):
         return None
     if _paragraph_is_instruction_leak(cleaned) or _text_still_meta_ridden(cleaned):
+        return None
+    if _is_degenerate_repetitive_output(cleaned):
         return None
     return cleaned
 
@@ -571,6 +631,8 @@ def _sentence_smells_meta(s: str) -> bool:
         "interjects →",
         "model reasoning",
         "avoid repeating",
+        "we answered:",
+        "weread more",
     )
     return any(m in low for m in junk_markers)
 
@@ -1131,6 +1193,16 @@ async def run_debate_stream(
                 full_trimmed = (
                     _keep_first_non_meta_sentences(alt, 3) or _trim_to_max_sentences(alt, 3)
                 )
+        if _is_degenerate_repetitive_output(full_trimmed):
+            retry = _keep_first_non_meta_sentences(raw, 3)
+            if not _is_degenerate_repetitive_output(retry):
+                full_trimmed = _strip_primary_speech_meta(retry).strip() or retry.strip()
+            else:
+                q = _salvage_quoted_speech(full)
+                if q and not _is_degenerate_repetitive_output(q):
+                    full_trimmed = _keep_first_non_meta_sentences(q, 3) or _trim_to_max_sentences(q, 3)
+        if _is_degenerate_repetitive_output(full_trimmed):
+            full_trimmed = ""
         yield {
             "type": "agent_end",
             "agent": agent["id"],
