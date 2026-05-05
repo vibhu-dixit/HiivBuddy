@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+
+import { useAuth } from "../auth/AuthProvider";
 
 import { ChamberSeats } from "./ChamberSeats";
 import { DEBATE_AGENTS } from "./debateAgents";
@@ -14,6 +17,10 @@ import type { Turn } from "./debateTypes";
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 /** Must match API `MAX_EXTRACTED_CHARS` in context_ingest.py */
 const MAX_CONTEXT_CHARS = 65536;
+
+function authHeaders(token: string, extra?: HeadersInit): HeadersInit {
+  return { ...extra, Authorization: `Bearer ${token}` };
+}
 
 type SessionStart = {
   type: "session_start";
@@ -105,7 +112,7 @@ function parseSseBlock(block: string): StreamEvent | null {
   const lines = block.split("\n").filter(Boolean);
   for (const line of lines) {
     if (line.startsWith("data: ")) {
-      const raw = line.slice(6);
+      const raw = line.slice(6).trimEnd();
       try {
         return JSON.parse(raw) as StreamEvent;
       } catch {
@@ -137,6 +144,20 @@ function formatSavedAt(iso: string): string {
 }
 
 export default function DecisionRoomPage() {
+  const router = useRouter();
+  const { token, user, loading: authLoading, logout } = useAuth();
+
+  useEffect(() => {
+    if (!authLoading && (!token || !user)) {
+      router.replace("/");
+    }
+  }, [authLoading, token, user, router]);
+
+  useEffect(() => {
+    if (!user) return;
+    setDebateHistory(loadDebates(user.userId));
+  }, [user]);
+
   const [context, setContext] = useState("");
   const [model, setModel] = useState(
     () => process.env.NEXT_PUBLIC_DEFAULT_MODEL ?? "stepfun-ai/step-3.5-flash",
@@ -201,10 +222,6 @@ export default function DecisionRoomPage() {
     synth_env_snapshot: false,
   });
 
-  useEffect(() => {
-    setDebateHistory(loadDebates());
-  }, []);
-
   const clearFlashTimer = useCallback(() => {
     if (flashClearRef.current) {
       clearTimeout(flashClearRef.current);
@@ -250,6 +267,10 @@ export default function DecisionRoomPage() {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
+      if (!token) {
+        setContextFileMessage("Sign in to attach PDFs.");
+        return;
+      }
       setContextFileMessage(null);
       const name = file.name || "file";
       const ext = name.includes(".") ? (name.split(".").pop() ?? "").toLowerCase() : "";
@@ -262,7 +283,11 @@ export default function DecisionRoomPage() {
         if (isPdf) {
           const fd = new FormData();
           fd.append("file", file, name);
-          const res = await fetch(`${API_URL}/context/extract`, { method: "POST", body: fd });
+          const res = await fetch(`${API_URL}/context/extract`, {
+            method: "POST",
+            headers: authHeaders(token),
+            body: fd,
+          });
           if (!res.ok) {
             const t = await res.text();
             throw new Error(t || res.statusText);
@@ -288,7 +313,7 @@ export default function DecisionRoomPage() {
         setContextFileMessage(err instanceof Error ? err.message : "Could not read file.");
       }
     },
-    [applyExtractedContext],
+    [applyExtractedContext, token],
   );
 
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -476,16 +501,21 @@ export default function DecisionRoomPage() {
       report,
       error,
     };
-    appendDebate(entry);
-    setDebateHistory(loadDebates());
-  }, [running, turns, voteTally, report, voteOptions, error]);
+    if (!user) return;
+    appendDebate(user.userId, entry);
+    setDebateHistory(loadDebates(user.userId));
+  }, [running, turns, voteTally, report, voteOptions, error, user]);
 
   const handleDeleteArchive = useCallback(
     async (d: StoredDebate) => {
+      if (!token || !user) return;
       setHistoryError(null);
       if (typeof d.run_id === "number") {
         try {
-          const res = await fetch(`${API_URL}/debate/runs/${d.run_id}`, { method: "DELETE" });
+          const res = await fetch(`${API_URL}/debate/runs/${d.run_id}`, {
+            method: "DELETE",
+            headers: authHeaders(token),
+          });
           if (!res.ok && res.status !== 404) {
             const t = await res.text();
             throw new Error(t || res.statusText);
@@ -495,11 +525,11 @@ export default function DecisionRoomPage() {
           return;
         }
       }
-      removeDebate(d.id);
-      setDebateHistory(loadDebates());
+      removeDebate(user.userId, d.id);
+      setDebateHistory(loadDebates(user.userId));
       setSelectedArchiveId((cur) => (cur === d.id ? null : cur));
     },
-    [],
+    [token, user],
   );
 
   const runDebate = useCallback(async () => {
@@ -540,10 +570,38 @@ export default function DecisionRoomPage() {
       synth_env_snapshot: synthEnvSnapshot,
     };
 
+    if (!token) {
+      setError("Not signed in.");
+      setRunning(false);
+      return;
+    }
+
+    // #region agent log
+    fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
+      body: JSON.stringify({
+        sessionId: "148c8e",
+        location: "decision-room/page.tsx:runDebate",
+        message: "debate_run_start",
+        data: {
+          hypothesisId: "C",
+          selectedArchiveId,
+          contextLen: context.length,
+          modelIdLen: model.length,
+          sessionMode,
+          apiBase: API_URL,
+        },
+        timestamp: Date.now(),
+        runId: "debate",
+      }),
+    }).catch(() => {});
+    // #endregion
+
     try {
       const res = await fetch(`${API_URL}/debate/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(token, { "Content-Type": "application/json" }),
         body: JSON.stringify({
           context,
           model,
@@ -556,6 +614,26 @@ export default function DecisionRoomPage() {
         }),
       });
 
+      // #region agent log
+      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
+        body: JSON.stringify({
+          sessionId: "148c8e",
+          location: "decision-room/page.tsx:runDebate",
+          message: "debate_fetch_response",
+          data: {
+            hypothesisId: "A",
+            ok: res.ok,
+            status: res.status,
+            ct: res.headers.get("content-type") ?? "",
+          },
+          timestamp: Date.now(),
+          runId: "debate",
+        }),
+      }).catch(() => {});
+      // #endregion
+
       if (!res.ok) {
         const t = await res.text();
         throw new Error(t || res.statusText);
@@ -566,18 +644,30 @@ export default function DecisionRoomPage() {
 
       const decoder = new TextDecoder();
       let carry = "";
+      let chunkReads = 0;
+      let parsedEvents = 0;
+      let firstEvType: string | null = null;
+      let nonemptyUnparsedBlocks = 0;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        chunkReads += 1;
         carry += decoder.decode(value, { stream: true });
+        // Normalize CRLF so SSE event boundaries (\n\n) split correctly (HTTP often uses \r\n).
+        carry = carry.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
         const parts = carry.split("\n\n");
         carry = parts.pop() ?? "";
 
         for (const block of parts) {
           const ev = parseSseBlock(block);
-          if (!ev) continue;
+          if (!ev) {
+            if (block.trim().length > 0) nonemptyUnparsedBlocks += 1;
+            continue;
+          }
+          parsedEvents += 1;
+          if (firstEvType === null) firstEvType = ev.type;
 
           switch (ev.type) {
             case "session_start": {
@@ -734,7 +824,48 @@ export default function DecisionRoomPage() {
           }
         }
       }
+
+      // #region agent log
+      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
+        body: JSON.stringify({
+          sessionId: "148c8e",
+          location: "decision-room/page.tsx:runDebate",
+          message: "debate_stream_complete",
+          data: {
+            hypothesisId: "B",
+            chunkReads,
+            parsedEvents,
+            firstEvType,
+            nonemptyUnparsedBlocks,
+            carryRemainLen: carry.length,
+          },
+          timestamp: Date.now(),
+          runId: "debate",
+        }),
+      }).catch(() => {});
+      // #endregion
     } catch (e) {
+      // #region agent log
+      const err = e instanceof Error ? e : new Error(String(e));
+      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
+        body: JSON.stringify({
+          sessionId: "148c8e",
+          location: "decision-room/page.tsx:runDebate",
+          message: "debate_stream_error",
+          data: {
+            hypothesisId: "A",
+            errorName: err.name,
+            errorMessage: err.message.slice(0, 300),
+          },
+          timestamp: Date.now(),
+          runId: "debate",
+        }),
+      }).catch(() => {});
+      // #endregion
       setError(e instanceof Error ? e.message : "Request failed");
     } finally {
       setRunning(false);
@@ -753,7 +884,17 @@ export default function DecisionRoomPage() {
     trackEnvironment,
     synthEnvSnapshot,
     clearFlashTimer,
+    token,
+    selectedArchiveId,
   ]);
+
+  if (authLoading || !token || !user) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center p-8">
+        <p className="text-sm text-[var(--muted)]">Loading…</p>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto box-border flex min-h-0 w-full max-w-[min(100%,92rem)] flex-1 flex-col gap-4 overflow-y-auto p-6">
@@ -765,9 +906,22 @@ export default function DecisionRoomPage() {
             in the last {sessionClock?.synth_reserve_sec ?? 30}s of the session.
           </p>
         </div>
-        <Link href="/" className="shrink-0 text-sm text-[var(--muted)] hover:text-[var(--foreground)]">
-          Home
-        </Link>
+        <div className="flex shrink-0 flex-col items-end gap-2 sm:flex-row sm:items-center sm:gap-4">
+          <span className="text-xs text-[var(--muted)]">{user.username}</span>
+          <button
+            type="button"
+            onClick={() => {
+              logout();
+              router.replace("/");
+            }}
+            className="text-sm text-[var(--muted)] hover:text-[var(--foreground)]"
+          >
+            Log out
+          </button>
+          <Link href="/" className="text-sm text-[var(--muted)] hover:text-[var(--foreground)]">
+            Home
+          </Link>
+        </div>
       </header>
 
       {/* Mobile: chamber → history → form → debate. Desktop: chamber+timer | history; debate | form */}

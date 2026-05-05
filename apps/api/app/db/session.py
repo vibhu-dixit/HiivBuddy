@@ -30,7 +30,9 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 async def init_db() -> None:
     from app.db import models as _models  # noqa: F401 — register tables on Base.metadata
+    from app.db.migrate_sqlite import migrate_sqlite_schema
 
     os.makedirs(DATA_DIR, exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await migrate_sqlite_schema(conn)

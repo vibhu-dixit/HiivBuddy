@@ -39,6 +39,30 @@ from app.llm.messages import prepare_chat_messages
 logger = logging.getLogger(__name__)
 
 
+def _delta_content_piece(delta: Any) -> str:
+    """Normalize OpenAI-style `delta.content` (str, or list of text parts) to a single string."""
+    c = getattr(delta, "content", None)
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for part in c:
+            if isinstance(part, dict):
+                t = part.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+                elif isinstance(part.get("content"), str):
+                    parts.append(part["content"])
+            else:
+                t = getattr(part, "text", None)
+                if isinstance(t, str):
+                    parts.append(t)
+        return "".join(parts)
+    return str(c) if c else ""
+
+
 def _debate_environment_seed(context: str, explicit: int | None) -> int:
     if explicit is not None:
         return int(explicit) & 0x7FFFFFFF
@@ -1252,12 +1276,16 @@ async def run_debate_stream(
             if reasoning:
                 full_reasoning += reasoning
                 yield {"type": "reasoning_token", "agent": agent["id"], "text": reasoning}
-            if getattr(delta, "content", None) is not None:
-                piece = delta.content or ""
+            piece = _delta_content_piece(delta)
+            if piece:
                 full += piece
                 yield {"type": "token", "agent": agent["id"], "text": piece}
 
         raw = _strip_transcript_artifacts((full or "").strip())
+        # Some NVIDIA / thinking routes stream visible speech only in reasoning_content; primary kwargs
+        # disable extra_body but providers may still omit content — salvage from reasoning for display.
+        if not raw and (full_reasoning or "").strip():
+            raw = _strip_transcript_artifacts(full_reasoning.strip())
         # Sentence-filter the raw stream first — paragraph strip alone drops mixed meta+speech blocks entirely.
         full_trimmed = _keep_first_non_meta_sentences(raw, 3)
         if not full_trimmed.strip():
@@ -1283,6 +1311,15 @@ async def run_debate_stream(
             full_trimmed = ""
         if _looks_like_moderator_echo(full_trimmed):
             full_trimmed = ""
+        # Last resort: visible reply never empty when the model only streamed reasoning/trace text.
+        if not (full_trimmed or "").strip() and (full_reasoning or "").strip():
+            fr = full_reasoning.strip()
+            cand = (
+                _trim_to_max_sentences(_strip_primary_speech_meta(fr), 4).strip()
+                or _trim_to_max_sentences(fr, 4).strip()
+                or fr[:2400]
+            )
+            full_trimmed = cand
         yield {
             "type": "agent_end",
             "agent": agent["id"],

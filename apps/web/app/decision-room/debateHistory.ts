@@ -37,13 +37,16 @@ export type StoredDebate = {
   run_id?: number;
 };
 
-const STORAGE_KEY = "hiivbuddy-decision-debates-v1";
 const MAX_ITEMS = 60;
 
-function loadRaw(): StoredDebate[] {
+export function debateStorageKey(userId: number): string {
+  return `hiivbuddy-decision-debates-v1-u${userId}`;
+}
+
+function loadRaw(userId: number): StoredDebate[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(debateStorageKey(userId));
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
@@ -53,21 +56,21 @@ function loadRaw(): StoredDebate[] {
   }
 }
 
-export function loadDebates(): StoredDebate[] {
-  return loadRaw().sort(
+export function loadDebates(userId: number): StoredDebate[] {
+  return loadRaw(userId).sort(
     (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime(),
   );
 }
 
-export function appendDebate(entry: StoredDebate): void {
+export function appendDebate(userId: number, entry: StoredDebate): void {
   if (typeof window === "undefined") return;
-  const prev = loadRaw();
+  const prev = loadRaw(userId);
   const next = [entry, ...prev.filter((d) => d.id !== entry.id)].slice(0, MAX_ITEMS);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  localStorage.setItem(debateStorageKey(userId), JSON.stringify(next));
 }
 
-export function removeDebate(id: string): void {
+export function removeDebate(userId: number, id: string): void {
   if (typeof window === "undefined") return;
-  const next = loadRaw().filter((d) => d.id !== id);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  const next = loadRaw(userId).filter((d) => d.id !== id);
+  localStorage.setItem(debateStorageKey(userId), JSON.stringify(next));
 }

@@ -100,7 +100,7 @@ export function DebateTranscript({
                     Interjects to <span className="font-medium">{t.targetName}</span>
                   </p>
                 )}
-                {t.reasoning && t.reasoning.length > 0 && (
+                {t.reasoning && t.reasoning.length > 0 && (t.text?.trim() ?? "") !== "" && (
                   <details className="mt-2 text-xs">
                     <summary className="cursor-pointer text-[var(--muted)] hover:text-[var(--foreground)]">
                       Model reasoning (thinking)
@@ -110,7 +110,16 @@ export function DebateTranscript({
                     </pre>
                   </details>
                 )}
-                <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed">{t.text}</p>
+                {t.reasoning && t.reasoning.length > 0 && !(t.text?.trim() ?? "") && (
+                  <p className="mt-2 text-[10px] uppercase tracking-wide text-[var(--muted)]">
+                    Response arrived via model trace (speech channel empty)
+                  </p>
+                )}
+                <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed">
+                  {(t.text?.trim() ?? "") ||
+                    (t.reasoning?.trim() ?? "") ||
+                    (running ? "…" : "")}
+                </p>
               </article>
             </div>
           ))}
