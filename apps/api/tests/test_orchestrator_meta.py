@@ -1,64 +1,66 @@
-"""Guards against chain-of-thought / rubric text in visible debate lines."""
+"""Post-processing for visible debate lines (meta strip + sentence cap)."""
 
 from app.debate.orchestrator import (
+    _clean_primary_spoken_text,
     _is_degenerate_repetitive_output,
-    _keep_first_non_meta_sentences,
+    _is_near_duplicate_primary,
     _looks_like_moderator_echo,
+    _normalize_spoken_line,
     _scrub_transcript_tail_for_prompt,
-    _sentence_smells_meta,
 )
 
 
-def test_sentence_smells_meta_flags_planning():
-    assert _sentence_smells_meta("We need to output as Ethical Guardian.")
-    assert _sentence_smells_meta('Check no meta. No "we".')
-    assert not _sentence_smells_meta(
-        "Risk Guru, late-night cramming often cuts sleep enough to wipe next-day gains."
-    )
-
-
-def test_keep_first_non_meta_sentences_skips_prefix():
+def test_clean_primary_text_slices_after_i_think_when_present():
     blob = (
         "We need to output as Data Analyst. Must be three sentences. "
-        "I'd lean toward studying tonight because measurable exam readiness typically matters."
+        "I think I'd lean toward studying tonight because measurable exam readiness typically matters."
     )
-    out = _keep_first_non_meta_sentences(blob, 3)
+    out = _clean_primary_spoken_text(blob)
+    assert out.startswith("I think")
     assert "We need to output" not in out
-    assert "Must be three" not in out
-    assert "lean toward studying" in out
 
 
-def test_keep_first_non_meta_interjection_style():
-    t = (
-        'Check no meta. No "we". Avoid repeating Data Analyst. '
-        "Research shows brief walks after reading improve retention by a few percent."
+def test_clean_primary_text_keeps_natural_opening_without_i_think():
+    blob = (
+        "Honestly, sunrise wins on consistency—you're trading drama for sleep debt.\n\n"
+        "Second paragraph stays."
     )
-    out = _keep_first_non_meta_sentences(t, 2)
-    assert "Check no meta" not in out
-    assert "Research shows" in out
+    out = _clean_primary_spoken_text(blob)
+    assert "Honestly" in out
+    assert "Second paragraph" in out
+
+
+def test_normalize_spoken_line_caps_sentences():
+    t = "I think one. Two here? Three! Four dropped."
+    out = _normalize_spoken_line(t, 3)
+    assert out == "I think one. Two here? Three!"
+    assert "Four dropped" not in out
 
 
 def test_degenerate_repetition_detected():
     loop = "We answered: Yes " * 40
     assert _is_degenerate_repetitive_output(loop)
     assert not _is_degenerate_repetitive_output(
-        "Risk Guru, surveys show most participants exit within a year with net losses after purchases."
+        "I think surveys show most participants exit within a year with net losses after purchases."
     )
-
-
-def test_sentence_smells_meta_flags_instruction_echo():
-    assert _sentence_smells_meta("We answered: YesWe answered: YesWe answered: Yes")
 
 
 def test_scrub_drops_instruction_echo_lines():
     blob = (
         "[Turn 2][Data Analyst]: Tracking hours matters.\n"
         "Must be in-character, spoken dialogue only.\n"
-        "Risk Guru, the downside is real."
+        "I think the downside is real."
     )
     out = _scrub_transcript_tail_for_prompt(blob)
     assert "Must be in-character" not in out
-    assert "Risk Guru" in out
+    assert "I think" in out
+
+
+def test_near_duplicate_primary_detected():
+    a = "I think sunrise gives calm energy for tests without wrecking sleep cycles entirely."
+    assert _is_near_duplicate_primary(a, a)
+    assert _is_near_duplicate_primary(a, a + " ")
+    assert not _is_near_duplicate_primary(a, "I think sunset fits night owls better.")
 
 
 def test_moderator_echo_detected():
@@ -66,5 +68,5 @@ def test_moderator_echo_detected():
         "Must be in-character, spoken dialogue only. Must agree or disagree."
     )
     assert not _looks_like_moderator_echo(
-        "Risk Guru, surveys show most participants exit within a year with net losses."
+        "I think surveys show most participants exit within a year with net losses."
     )

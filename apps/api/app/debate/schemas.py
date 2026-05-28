@@ -58,7 +58,7 @@ class DebateRequest(BaseModel):
         description="After each main speaker, other advisors may interject in parallel (PASS if no objection)",
     )
     session_mode: Literal["classic", "swarm"] = Field(
-        default="classic",
+        default="swarm",
         validation_alias=AliasChoices("session_mode", "debate_mode"),
         serialization_alias="session_mode",
         description="classic: streaming lap debate; swarm: structured JSON turns + shared env",

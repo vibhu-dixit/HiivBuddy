@@ -69,6 +69,11 @@ export function appendDebate(userId: number, entry: StoredDebate): void {
   localStorage.setItem(debateStorageKey(userId), JSON.stringify(next));
 }
 
+export function clearDebatesForUser(userId: number): void {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(debateStorageKey(userId));
+}
+
 export function removeDebate(userId: number, id: string): void {
   if (typeof window === "undefined") return;
   const next = loadRaw(userId).filter((d) => d.id !== id);

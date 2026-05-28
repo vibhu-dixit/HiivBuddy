@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import random
 from openai import AsyncOpenAI
@@ -28,7 +28,9 @@ from app.debate.swarm_schemas import (
     parse_swarm_turn_response,
     swarm_response_to_agent_action,
     transcript_line_for_turn,
+    user_visible_turn_line,
 )
+from app.debate.context_options import seed_environment_options_from_context
 from app.debate.environment import AgentAction, PassAction
 from app.llm.client import Settings
 from app.llm.messages import prepare_chat_messages
@@ -56,6 +58,7 @@ async def run_swarm_session_stream(
     t0 = time.monotonic()
     transcript = ""
     base_kw = llm.common_completion_kwargs()
+    debate_model = llm.resolved_debate_model(model)
     effective_track = True
 
     yield {
@@ -73,173 +76,192 @@ async def run_swarm_session_stream(
         limits=limits,
         mode="swarm",
     )
+    session_env = seed_environment_options_from_context(session_env, context)
     rng = random.Random(seed)
     speech_count = init_speech_counts(AGENTS)
     obs_config = ObservationConfig()
     turn_index = 0
+    max_speaker_attempts = len(AGENTS)
 
     while (time.monotonic() - t0) < debate_budget_sec:
-        turn_index += 1
-        agent = pick_next_agent_swarm(AGENTS, rng, speech_count)
-        speech_count[agent["id"]] = speech_count[agent["id"]] + 1
+        visible_line: str | None = None
+        visible_agent: dict[str, Any] | None = None
 
-        remaining = int(debate_budget_sec - (time.monotonic() - t0))
-        obs = build_observation(
-            session_env,
-            agent_id=agent["id"],
-            agent_display_name=agent["name"],
-            context_text=context,
-            debate_seconds_remaining=max(0, remaining),
-            config=obs_config,
-        )
-        user_body = json.dumps(obs, ensure_ascii=False) + "\n\nReturn your JSON decision now."
-        sys_content = f"{agent['system']}{SWARM_JSON_RULES}"
-        msgs = prepare_chat_messages(
-            [
-                {"role": "system", "content": sys_content},
-                {"role": "user", "content": user_body},
-            ],
-            model,
-            llm,
-        )
-        kw = _completion_kw_for_messages(base_kw, msgs, llm, 2048)
+        for _attempt in range(max_speaker_attempts):
+            if (time.monotonic() - t0) >= debate_budget_sec:
+                break
 
-        t_llm = time.monotonic()
-        parsed: SwarmTurnResponse | None = None
-        retry_count = 0
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                response_format={"type": "json_object"},
-                messages=msgs,
-                **kw,
+            agent = pick_next_agent_swarm(AGENTS, rng, speech_count)
+            speech_count[agent["id"]] = speech_count[agent["id"]] + 1
+
+            remaining = int(debate_budget_sec - (time.monotonic() - t0))
+            obs = build_observation(
+                session_env,
+                agent_id=agent["id"],
+                agent_display_name=agent["name"],
+                context_text=context,
+                debate_seconds_remaining=max(0, remaining),
+                config=obs_config,
             )
-            raw0 = _synth_raw_from_assistant_message(resp.choices[0].message)
+            user_body = json.dumps(obs, ensure_ascii=False) + "\n\nReturn your JSON decision now."
+            sys_content = f"{agent['system']}{SWARM_JSON_RULES}"
+            msgs = prepare_chat_messages(
+                [
+                    {"role": "system", "content": sys_content},
+                    {"role": "user", "content": user_body},
+                ],
+                debate_model,
+                llm,
+            )
+            kw = _completion_kw_for_messages(base_kw, msgs, llm, 2048)
+
+            t_llm = time.monotonic()
+            parsed: SwarmTurnResponse | None = None
+            retry_count = 0
             try:
-                parsed = parse_swarm_turn_response(raw0)
-            except Exception as e1:
-                retry_count = 1
-                repair = (
-                    f"Your previous output was invalid: {e1}. "
-                    "Return ONLY one JSON object with a valid \"action\" and required fields."
-                )
-                msgs2 = prepare_chat_messages(
-                    [
-                        {"role": "system", "content": sys_content},
-                        {"role": "user", "content": user_body},
-                        {"role": "user", "content": repair},
-                    ],
-                    model,
-                    llm,
-                )
-                kw2 = _completion_kw_for_messages(base_kw, msgs2, llm, 2048)
-                resp2 = await client.chat.completions.create(
-                    model=model,
+                resp = await client.chat.completions.create(
+                    model=debate_model,
                     response_format={"type": "json_object"},
-                    messages=msgs2,
-                    **kw2,
+                    messages=msgs,
+                    **kw,
                 )
-                raw1 = _synth_raw_from_assistant_message(resp2.choices[0].message)
+                raw0 = _synth_raw_from_assistant_message(resp.choices[0].message)
                 try:
-                    parsed = parse_swarm_turn_response(raw1)
-                except Exception as e2:
+                    parsed = parse_swarm_turn_response(raw0)
+                except Exception as e1:
+                    retry_count = 1
+                    repair = (
+                        f"Your previous output was invalid: {e1}. "
+                        "Return ONLY one JSON object with a valid \"action\" and required fields."
+                    )
+                    msgs2 = prepare_chat_messages(
+                        [
+                            {"role": "system", "content": sys_content},
+                            {"role": "user", "content": user_body},
+                            {"role": "user", "content": repair},
+                        ],
+                        debate_model,
+                        llm,
+                    )
+                    kw2 = _completion_kw_for_messages(base_kw, msgs2, llm, 2048)
+                    resp2 = await client.chat.completions.create(
+                        model=debate_model,
+                        response_format={"type": "json_object"},
+                        messages=msgs2,
+                        **kw2,
+                    )
+                    raw1 = _synth_raw_from_assistant_message(resp2.choices[0].message)
+                    try:
+                        parsed = parse_swarm_turn_response(raw1)
+                    except Exception as e2:
+                        logger.warning(
+                            "swarm JSON parse failed after retry",
+                            extra={
+                                "session_id": session_env.session_id,
+                                "agent_id": agent["id"],
+                                "turn_idx": turn_index,
+                                "errors": str(e2),
+                                "retry_count": retry_count,
+                            },
+                        )
+                        parsed = None
+            except Exception:
+                logger.warning("swarm LLM call failed", exc_info=True)
+                parsed = None
+
+            latency_ms = (time.monotonic() - t_llm) * 1000.0
+
+            if parsed is None:
+                action: AgentAction = PassAction(agent_id=agent["id"])
+                log_action = "pass"
+            else:
+                try:
+                    action = swarm_response_to_agent_action(parsed, agent["id"])
+                    log_action = parsed.action
+                except Exception as e:
                     logger.warning(
-                        "swarm JSON parse failed after retry",
+                        "swarm map to action failed",
                         extra={
                             "session_id": session_env.session_id,
                             "agent_id": agent["id"],
                             "turn_idx": turn_index,
-                            "errors": str(e2),
-                            "retry_count": retry_count,
+                            "errors": str(e),
                         },
                     )
-                    parsed = None
-        except Exception:
-            logger.warning("swarm LLM call failed", exc_info=True)
-            parsed = None
+                    action = PassAction(agent_id=agent["id"])
+                    parsed = SwarmTurnResponse(action="pass")
+                    log_action = "pass"
 
-        latency_ms = (time.monotonic() - t_llm) * 1000.0
+            display_parsed = parsed or SwarmTurnResponse(action="pass")
+            applied_final: AgentAction = action
 
-        if parsed is None:
-            action: AgentAction = PassAction(agent_id=agent["id"])
-            log_action = "pass"
-        else:
-            try:
-                action = swarm_response_to_agent_action(parsed, agent["id"])
-                log_action = parsed.action
-            except Exception as e:
+            result = apply_action(session_env, action)
+            if not result.ok:
                 logger.warning(
-                    "swarm map to action failed",
+                    "swarm apply_action failed; falling back to pass",
                     extra={
                         "session_id": session_env.session_id,
                         "agent_id": agent["id"],
                         "turn_idx": turn_index,
-                        "errors": str(e),
+                        "action": log_action,
+                        "apply_ok": False,
+                        "errors": result.errors,
+                        "latency_ms": round(latency_ms, 1),
+                        "retry_count": retry_count,
                     },
                 )
-                action = PassAction(agent_id=agent["id"])
-                parsed = SwarmTurnResponse(action="pass")
-                log_action = "pass"
+                result = apply_action(session_env, PassAction(agent_id=agent["id"]))
+                applied_final = PassAction(agent_id=agent["id"])
+                display_parsed = SwarmTurnResponse(action="pass")
 
-        display_parsed = parsed or SwarmTurnResponse(action="pass")
-        applied_final: AgentAction = action
+            if not result.ok:
+                logger.error(
+                    "swarm pass fallback failed",
+                    extra={"session_id": session_env.session_id, "agent_id": agent["id"]},
+                )
+                return
 
-        result = apply_action(session_env, action)
-        if not result.ok:
-            logger.warning(
-                "swarm apply_action failed; falling back to pass",
+            session_env = result.env
+            line = transcript_line_for_turn(display_parsed, applied_final)
+            visible_line = user_visible_turn_line(display_parsed, applied_final)
+
+            logger.debug(
+                "swarm turn",
                 extra={
                     "session_id": session_env.session_id,
                     "agent_id": agent["id"],
                     "turn_idx": turn_index,
                     "action": log_action,
-                    "apply_ok": False,
-                    "errors": result.errors,
+                    "apply_ok": True,
+                    "visible": visible_line is not None,
                     "latency_ms": round(latency_ms, 1),
                     "retry_count": retry_count,
                 },
             )
-            result = apply_action(session_env, PassAction(agent_id=agent["id"]))
-            applied_final = PassAction(agent_id=agent["id"])
-            display_parsed = SwarmTurnResponse(action="pass")
 
-        if not result.ok:
-            logger.error(
-                "swarm pass fallback failed",
-                extra={"session_id": session_env.session_id, "agent_id": agent["id"]},
-            )
-            break
+            transcript += f"\n\n[{agent['name']}]: {line}\n"
 
-        session_env = result.env
-        line = transcript_line_for_turn(display_parsed, applied_final)
+            if visible_line:
+                visible_agent = agent
+                break
 
-        logger.debug(
-            "swarm turn",
-            extra={
-                "session_id": session_env.session_id,
-                "agent_id": agent["id"],
-                "turn_idx": turn_index,
-                "action": log_action,
-                "apply_ok": True,
-                "latency_ms": round(latency_ms, 1),
-                "retry_count": retry_count,
-            },
-        )
+        if not visible_line or not visible_agent:
+            continue
 
+        turn_index += 1
         yield {
             "type": "agent_start",
-            "agent": agent["id"],
-            "name": agent["name"],
+            "agent": visible_agent["id"],
+            "name": visible_agent["name"],
             "turn": turn_index,
         }
         yield {
             "type": "agent_end",
-            "agent": agent["id"],
+            "agent": visible_agent["id"],
             "turn": turn_index,
-            "full_text": line,
+            "full_text": visible_line,
             "reasoning_text": None,
         }
-        transcript += f"\n\n[Turn {turn_index}][{agent['name']}]: {line}\n"
 
     yield {
         "type": "env_snapshot",

@@ -182,7 +182,7 @@ AGENTS: list[dict[str, str]] = [
     },
 ]
 
-SYNTH_SYSTEM = """You are the Chief Synthesizer for HiivBuddy.
+SYNTH_SYSTEM = """You are the Chief Synthesizer for Hiiv.
 You receive the decision context, full timed debate transcript, an anonymous vote tally per advisor, and a compact per-advisor stance trace (lean + confidence).
 Return ONLY valid JSON (no markdown) with keys:
 - summary: string (executive overview, 3-5 sentences). Mention whether a 3/5 (or configured threshold) consensus was reached and on which option if so; if not, say the panel was split.
@@ -201,18 +201,16 @@ confidence reflects how firm the advisor is; lean summarizes their current recom
 
 
 INTERJECTION_SYSTEM_ADDENDUM = (
-    " Interjection: output ONLY 1–2 sentences you would say aloud—one short paragraph, no title. "
-    "Forbidden: 'We need to respond as', 'Let's reconstruct', 'The user', role instructions, or quoting the prompt. "
-    "If nothing to add, output exactly PASS alone."
+    " Interjection: at most two sentences, spoken dialogue only—respond as you would at the table. "
+    "Do not quote instructions or summarize the prompt. If nothing to add, output exactly PASS alone."
 )
 
-# Primary turns: models (esp. with chain-of-thought) often paraphrase the user prompt or plan aloud.
+# Primary turns: natural speech; post-processing strips meta (see _clean_primary_spoken_text).
 PRIMARY_DEBATE_SYSTEM_ADDENDUM = (
-    " You are speaking aloud at a conference table, not writing an essay or a rubric. "
-    "Output ONLY what you would say in one breath: at most three sentences, no bullets. "
-    "Do not plan, outline, or say what you will argue. Do not quote or restate the moderator instructions. "
-    "Do not preface with meta like 'We need to', 'I'll pick', 'Probably', 'Given that', or 'As [role], we could'. "
-    "Start directly with your substance; if you address another advisor, use their role name naturally (e.g. 'Optimist, …')."
+    " You are speaking aloud at a conference table, not writing an essay. "
+    "At most three sentences, no bullets. "
+    "Speak in first person; jump straight into substance—do not quote moderator cues, rubric lines, "
+    "or narrate your role. Address other advisors by name when you respond to them."
 )
 
 
@@ -222,137 +220,6 @@ def _interjection_content_only(msg: Any) -> str:
     if isinstance(c, str) and c.strip():
         return c.strip()
     return ""
-
-
-def _paragraph_is_instruction_leak(p: str) -> bool:
-    """Drop model meta about the prompt (common with chain-of-thought in content)."""
-    pl = p.lower()
-    if "act as" in pl and "advisor" in pl:
-        return True
-    leaks = (
-        "the user wants",
-        "the user asked",
-        "user wants me",
-        "keep it to at most",
-        "two short sentences",
-        "in ≤2 spoken",
-        "in at most two spoken sentences",
-        "first line only: pass",
-        "or first line only",
-        "output exactly pass",
-        "reply with pass",
-        "thus we must output",
-        "we answered:",
-        "we answered yes",
-        "the instruction says",
-        "avoid repeating their",
-        "something material or correct",
-        "only add something",
-        "given the instructions",
-        "as an ai",
-        "as a language model",
-        "the user request",
-        "user request:",
-        "you are the optimist",
-        "you are the devil's advocate",
-        "you are the data analyst",
-        "you are the risk guru",
-        "you are the ethical guardian",
-        "highlight upside, opportunities",
-        "challenge assumptions",
-    )
-    return any(s in pl for s in leaks)
-
-
-def _paragraph_is_planning_meta(p: str) -> bool:
-    """Heuristic: rubric / planning / prompt echo — not spoken dialogue."""
-    pl = p.lower().strip()
-    if not pl:
-        return False
-    if _paragraph_is_instruction_leak(p):
-        return True
-    needles = (
-        "we are we",
-        "we need to pick",
-        "we need to respond",
-        "we need to respond as",
-        "we need to output",
-        "we need to produce",
-        "we need to read",
-        "we need to see",
-        "we need to parse",
-        "we need to determine",
-        "we need to identify",
-        "we need to add",
-        "we need to craft",
-        "thus we need",
-        "so we need",
-        "check no meta",
-        "must respond to at least",
-        "must be at most",
-        "must be ≤",
-        "the last instruction",
-        "the last line says",
-        "read the debate so far",
-        "let's parse the conversation",
-        "let's parse",
-        "output as ",
-        "output devil's",
-        "producing ",
-        "model reasoning",
-        "<details",
-        "we need to choose",
-        "we need to decide",
-        "we need to speak",
-        "respond as ",
-        "to respond as ",
-        "pick a participant",
-        "don't have optimist",
-        "don't have devil's",
-        "don't have ethical",
-        "no optimist's actual",
-        "infer they'd",
-        "infer they would",
-        "as they'd be speaking",
-        "speaking now (turn",
-        "presumably would argue",
-        "we could respond to",
-        "we'll disagree",
-        "we'll agree",
-        "probably optimist",
-        "probably the optimist",
-        "probably devil's",
-        "let's consider context:",
-        "let's reconstruct",
-        "initial context:",
-        "that's one sentence",
-        "that's two sentence",
-        "make sure no bullet",
-        "above is how",
-        "thus, we could say",
-        "thus we could say",
-        "so we could say:",
-        "consider:",
-        "do we agree, disagree",
-        "we should speak only",
-        "otherwise pass",
-        "as dialogue only",
-        "reply with exactly pass",
-        "reply with exactly",
-        "interjects →",
-        "for some reason they",
-        "they echoed",
-        "weird placeholder",
-        "data analyst might add",
-        "[turn ",
-        "actually turn ",
-        "looking back at the original problem",
-        "our analysis should cover",
-        "we/new",
-        "故障排序",
-        "机床震",
-    )
-    return any(n in pl for n in needles)
 
 
 def _is_degenerate_repetitive_output(text: str) -> bool:
@@ -400,6 +267,24 @@ _MOD_ECHO_PHRASES_SCRUB = (
     "risk guru (just now): must ",
     "data analyst (just now): build on",
     "the user gave a long context",
+    # Past user-message cues models echoed into speech
+    "jump in:",
+    "name another advisor",
+    "build on the thread:",
+    "bottom line:",
+    "then instruction",
+    "begin with \"i think\"",
+    "do not repeat or quote",
+    "max three short sentences",
+    "round: opening",
+    "round: reply",
+    "round: recommendation",
+    "round: extend",
+    "the user provided",
+    "we are in a conversation where",
+    "turn 1:",
+    "turn 2:",
+    "the user has pasted",
 )
 
 
@@ -441,6 +326,24 @@ def _looks_like_moderator_echo(text: str) -> bool:
         return True
     if "please read the following faq" in low:
         return True
+    if "jump in" in low and "advisor" in low and len(low) < 700:
+        return True
+    if "the debate so far" in low and "turn" in low and len(low) > 400:
+        return True
+    return False
+
+
+def _is_near_duplicate_primary(prev: str, cur: str) -> bool:
+    """Drop a turn that largely repeats the last primary speech (common model stutter)."""
+    a = (prev or "").strip().lower()
+    b = (cur or "").strip().lower()
+    if len(a) < 32 or len(b) < 32:
+        return False
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) >= 48 and shorter in longer:
+        return True
     return False
 
 
@@ -451,107 +354,45 @@ def _strip_transcript_artifacts(text: str) -> str:
     return t.strip()
 
 
+def _clean_primary_spoken_text(text: str) -> str:
+    """Drop planning noise: optional slice after 'I think', else drop meta-looking paragraphs."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    key = "i think"
+    idx = low.find(key)
+    if idx >= 0:
+        return t[idx:].strip()
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
+    if not paras:
+        return t
+    if len(paras) == 1:
+        p0 = paras[0]
+        return "" if _looks_like_moderator_echo(p0) else p0
+    kept = [p for p in paras if not _looks_like_moderator_echo(p)]
+    if kept:
+        return "\n\n".join(kept).strip()
+    return paras[-1]
+
+
+def _normalize_spoken_line(text: str, max_sentences: int) -> str:
+    """Strip transcript junk, drop meta preambles, then cap sentence count."""
+    t = _strip_transcript_artifacts((text or "").strip())
+    t = _clean_primary_spoken_text(t)
+    return _trim_to_max_sentences(t, max_sentences)
+
+
 def _salvage_quoted_speech(text: str) -> str | None:
-    """Use longest quoted span that looks like real table speech, not rubric."""
+    """Longest quoted span that looks like table speech, not rubric."""
     best: str | None = None
     for m in re.finditer(r'"([^"]{18,800})"', text or "", re.DOTALL):
         inner = " ".join(m.group(1).strip().split())
-        if not inner or _text_still_meta_ridden(inner) or _paragraph_is_planning_meta(inner):
+        if not inner or _is_degenerate_repetitive_output(inner) or _looks_like_moderator_echo(inner):
             continue
         if best is None or len(inner) > len(best):
             best = inner
     return best
-
-
-def _text_still_meta_ridden(text: str) -> bool:
-    """True if stripped text is still mostly rubric (drop interjection)."""
-    low = (text or "").lower().strip()
-    if not low:
-        return True
-    hard = (
-        "we need to respond as",
-        "we are we",
-        "the user request",
-        "you are the optimist",
-        "let's reconstruct",
-        "initial context:",
-        "[turn ",
-        "thus we must output",
-        "the instruction:",
-        "we answered:",
-        "in ≤2 spoken",
-        "first line only: pass",
-    )
-    return any(h in low for h in hard)
-
-
-def _strip_primary_speech_meta(text: str) -> str:
-    """Drop rubric / planning paragraphs anywhere in main debate turns."""
-    t = _strip_transcript_artifacts((text or "").strip())
-    if not t:
-        return ""
-    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
-    if not paras:
-        paras = [t]
-    kept = [
-        p
-        for p in paras
-        if not _paragraph_is_planning_meta(p) and not _paragraph_is_instruction_leak(p)
-    ]
-    out = "\n\n".join(kept).strip()
-    if not out:
-        out = _strip_interjection_meta(t)
-    if not out:
-        return ""
-    lines = out.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-        if _paragraph_is_planning_meta(line) and len(line) < 500:
-            i += 1
-            continue
-        break
-    return "\n".join(lines[i:]).strip() or out
-
-
-def _strip_interjection_meta(text: str) -> str:
-    """Remove rubric / planning paragraphs and leading junk from interjections."""
-    t = _strip_transcript_artifacts((text or "").strip())
-    if not t:
-        return ""
-    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
-    kept = [
-        p
-        for p in paras
-        if not _paragraph_is_instruction_leak(p) and not _paragraph_is_planning_meta(p)
-    ]
-    out = "\n\n".join(kept).strip()
-    if not out:
-        return ""
-    lines = out.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-        low = line.lower()
-        if line.startswith(("Okay,", "Ok,", "Well,", "So,")) and any(
-            x in low for x in ("user wants", "user asked", "need to", "should", "instructions", "act as")
-        ):
-            i += 1
-            continue
-        if _paragraph_is_instruction_leak(line) and len(line) < 400:
-            i += 1
-            continue
-        if _paragraph_is_planning_meta(line) and len(line) < 500:
-            i += 1
-            continue
-        break
-    return "\n".join(lines[i:]).strip()
 
 
 def _short_interjection_kwargs(base_kw: dict[str, Any]) -> dict[str, Any]:
@@ -638,27 +479,18 @@ async def _interjection_reply(
     if not raw or _is_pass_interjection(raw):
         return None
     cleaned = _clean_interjection(raw)
-    cleaned = _strip_interjection_meta(cleaned)
-    cleaned = _keep_first_non_meta_sentences(cleaned, 2)
-    if _text_still_meta_ridden(cleaned):
+    cleaned = _normalize_spoken_line(cleaned, 2)
+    if not cleaned.strip():
         alt = _salvage_quoted_speech(raw)
         if alt:
-            cleaned = _trim_to_max_sentences(alt, 2)
+            cleaned = _normalize_spoken_line(alt, 2)
     if not cleaned or re.match(r"^(PASS|NO\s*INTERRUPTION)\b", cleaned, re.I):
-        return None
-    if _paragraph_is_instruction_leak(cleaned) or _text_still_meta_ridden(cleaned):
         return None
     if _is_degenerate_repetitive_output(cleaned):
         return None
     if _looks_like_moderator_echo(cleaned):
         return None
     return cleaned
-
-
-DEBATE_OUTPUT_RULES = (
-    "\n\nOutput: at most three sentences of in-character speech. No bullet lists. "
-    "Speak only as your role—no meta-commentary, no describing your plan, no references to instructions or 'the user'."
-)
 
 
 def _trim_to_max_sentences(text: str, max_sentences: int = 3) -> str:
@@ -669,93 +501,6 @@ def _trim_to_max_sentences(text: str, max_sentences: int = 3) -> str:
     if len(parts) <= max_sentences:
         return text.strip()
     return " ".join(parts[:max_sentences]).strip()
-
-
-def _sentence_smells_meta(s: str) -> bool:
-    """Single-sentence check: drop chain-of-thought / rubric lines from streamed content."""
-    t = (s or "").strip()
-    if not t:
-        return True
-    if len(t) > 800 and _paragraph_is_planning_meta(t[:400]):
-        return True
-    if _paragraph_is_instruction_leak(t) or _paragraph_is_planning_meta(t):
-        return True
-    low = t.lower()
-    bad_prefixes = (
-        "we need to output",
-        "we need to produce",
-        "we need to respond as",
-        "we need to read the debate",
-        "we need to read the",
-        "we need to parse",
-        "we need to see what",
-        "we need to determine",
-        "we need to identify",
-        "we need to add",
-        "we need to craft",
-        "we need to understand the situation",
-        "we are to output",
-        "thus we need to",
-        "so we need to",
-        "check no meta",
-        "the last instruction",
-        "the last line says",
-        "let's parse",
-        "let's reconstruct",
-        "read the debate so far",
-        "sentence 1:",
-        "sentence 2:",
-        "must respond to at least",
-        "must be at most three",
-        "must be three sentence",
-        "must be three",
-        "must be ≤",
-    )
-    if any(low.startswith(p) for p in bad_prefixes):
-        return True
-    junk_markers = (
-        "```",
-        "<details",
-        "summary>",
-        "[turn ",
-        "interjects →",
-        "model reasoning",
-        "avoid repeating",
-        "we answered:",
-        "weread more",
-    )
-    if any(m in low for m in junk_markers):
-        return True
-    if len(t) < 420:
-        short_echo = (
-            "must be in-character",
-            "spoken dialogue only",
-            "we need to give initial",
-            "must build on prior turns",
-            "the instruction at the bottom",
-        )
-        if any(x in low for x in short_echo):
-            return True
-    return False
-
-
-def _keep_first_non_meta_sentences(text: str, max_sentences: int) -> str:
-    """After paragraph stripping, remove leading rubric sentences; keep up to N in-character sentences."""
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    parts = re.split(r"(?<=[.!?])\s+", raw)
-    kept: list[str] = []
-    for p in parts:
-        s = p.strip()
-        if not s:
-            continue
-        if _sentence_smells_meta(s):
-            continue
-        kept.append(s)
-        if len(kept) >= max_sentences:
-            break
-    return " ".join(kept).strip()
 
 
 def _primary_debate_kwargs(base_kw: dict[str, Any]) -> dict[str, Any]:
@@ -804,27 +549,14 @@ def _debate_deadline_elapsed(t0: float, debate_budget_sec: float) -> bool:
 
 
 def _timed_debate_user_block(turn_index: int) -> str:
+    """Minimal turn cue only—constraints live in system messages so models do not quote rubric lines aloud."""
     if turn_index <= 1:
-        return (
-            "This is your first turn in this timed session. Give your initial stance in at most three sentences. "
-            "State what you lean toward and the main reason, in character."
-            + DEBATE_OUTPUT_RULES
-        )
+        return "Round: opening."
     if turn_index <= 5:
-        return (
-            "Read the debate so far. In at most three sentences, respond to at least one other participant BY NAME "
-            "(e.g. Optimist, Devil's Advocate). Agree, disagree, or refine one point with a concrete reason."
-            + DEBATE_OUTPUT_RULES
-        )
+        return "Round: reply to another advisor by name."
     if turn_index % 5 == 0:
-        return (
-            "In at most three sentences, state your bottom-line recommendation and what evidence would change your mind."
-            + DEBATE_OUTPUT_RULES
-        )
-    return (
-        "In at most three sentences, build on prior turns; respond to others by name; stress-test one main argument."
-        + DEBATE_OUTPUT_RULES
-    )
+        return "Round: state your recommendation and what would change your mind."
+    return "Round: extend or challenge the thread."
 
 
 def _closing_votes_to_records(
@@ -883,6 +615,53 @@ OPTIONS_FALLBACK_SYSTEM = """You extract discrete decision options for a panel v
 Return ONLY valid JSON: {"options": [{"id":"0","title":"short label"}, ...]}
 Use 2 to 4 options, ids "0","1","2","3" in order. Titles must be mutually distinct and reflect main forks from the debate."""
 
+_DEFAULT_VOTE_OPTIONS = [
+    VoteOptionItem(id="0", title="Primary path from the debate"),
+    VoteOptionItem(id="1", title="Alternative path from the debate"),
+]
+
+
+def _synth_model_candidates(llm: Settings, request_model: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for candidate in (
+        llm.resolved_synth_model(request_model),
+        llm.resolved_debate_model(request_model),
+        (request_model or "").strip(),
+        getattr(llm, "llm_default_model", "") or "",
+    ):
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            out.append(candidate)
+    return out
+
+
+async def _create_json_completion(
+    client: AsyncOpenAI,
+    *,
+    models: list[str],
+    messages: list[dict[str, Any]],
+    llm: Settings,
+    max_tokens: int = 4096,
+) -> tuple[str, Any]:
+    base_kw = llm.common_completion_kwargs()
+    last_exc: Exception | None = None
+    for model_id in models:
+        try:
+            resp = await client.chat.completions.create(
+                model=model_id,
+                response_format={"type": "json_object"},
+                messages=messages,
+                **_completion_kw_for_messages(base_kw, messages, llm, max_tokens),
+            )
+            return model_id, resp
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("LLM json completion failed model=%s: %s", model_id, exc)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("No LLM model configured for synthesis")
+
 
 async def run_post_debate_phases(
     client: AsyncOpenAI,
@@ -898,6 +677,8 @@ async def run_post_debate_phases(
 ) -> AsyncIterator[dict[str, Any]]:
     """Vote extraction, tally, Chief Synthesizer — shared by classic and structured swarm."""
     threshold = max(1, min(5, consensus_threshold))
+    synth_models = _synth_model_candidates(llm, model)
+    synth_model = synth_models[0]
     base_kw = llm.common_completion_kwargs()
     se = session_env_box[0]
 
@@ -914,14 +695,14 @@ async def run_post_debate_phases(
                 {"role": "system", "content": CLOSING_SYSTEM},
                 {"role": "user", "content": closing_user},
             ],
-            model,
+            synth_model,
             llm,
         )
-        closing_resp = await client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
+        synth_model, closing_resp = await _create_json_completion(
+            client,
+            models=synth_models,
             messages=closing_msgs,
-            **_completion_kw_for_messages(base_kw, closing_msgs, llm, 4096),
+            llm=llm,
         )
         closing_raw = _synth_raw_from_assistant_message(closing_resp.choices[0].message)
         parsed_closing = _parse_json_to_model(closing_raw, ClosingPhaseResponse)
@@ -938,17 +719,21 @@ async def run_post_debate_phases(
                 {"role": "system", "content": OPTIONS_FALLBACK_SYSTEM},
                 {"role": "user", "content": opts_user},
             ],
-            model,
+            synth_model,
             llm,
         )
-        opt_resp = await client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=opt_msgs,
-            **_completion_kw_for_messages(base_kw, opt_msgs, llm, 4096),
-        )
-        opt_raw = _synth_raw_from_assistant_message(opt_resp.choices[0].message)
-        vote_opts_fb = _normalize_vote_options(_parse_json_to_model(opt_raw, VoteOptionsResponse))
+        vote_opts_fb = list(_DEFAULT_VOTE_OPTIONS)
+        try:
+            synth_model, opt_resp = await _create_json_completion(
+                client,
+                models=synth_models,
+                messages=opt_msgs,
+                llm=llm,
+            )
+            opt_raw = _synth_raw_from_assistant_message(opt_resp.choices[0].message)
+            vote_opts_fb = _normalize_vote_options(_parse_json_to_model(opt_raw, VoteOptionsResponse))
+        except Exception:
+            logger.warning("Vote option extraction failed; using default options", exc_info=True)
         allowed_ids_fb = {o.id for o in vote_opts_fb}
         opts_lines = "\n".join(f"  id={o.id}: {o.title}" for o in vote_opts_fb)
 
@@ -965,19 +750,25 @@ async def run_post_debate_phases(
                     {"role": "system", "content": agent["system"]},
                     {"role": "user", "content": vote_user},
                 ],
-                model,
+                synth_model,
                 llm,
             )
-            vresp = await client.chat.completions.create(
-                model=model,
-                response_format={"type": "json_object"},
-                messages=vote_msgs,
-                **_completion_kw_for_messages(base_kw, vote_msgs, llm, 4096),
-            )
-            vraw = _synth_raw_from_assistant_message(vresp.choices[0].message)
-            vparsed = _parse_json_to_model(vraw, AgentVoteResponse)
-            assert isinstance(vparsed, AgentVoteResponse)
-            oid = (vparsed.option_id or "").strip()
+            try:
+                _, vresp = await _create_json_completion(
+                    client,
+                    models=synth_models,
+                    messages=vote_msgs,
+                    llm=llm,
+                    max_tokens=512,
+                )
+                vraw = _synth_raw_from_assistant_message(vresp.choices[0].message)
+                vparsed = _parse_json_to_model(vraw, AgentVoteResponse)
+                assert isinstance(vparsed, AgentVoteResponse)
+                oid = (vparsed.option_id or "").strip()
+                rationale = (vparsed.rationale or "")[:300]
+            except Exception:
+                oid = min(allowed_ids_fb, key=lambda x: int(x))
+                rationale = ""
             if oid not in allowed_ids_fb:
                 try:
                     cand = str(int(float(oid)))
@@ -990,7 +781,7 @@ async def run_post_debate_phases(
             return ClosingVoteItem(
                 agent_id=agent["id"],
                 option_id=oid,
-                rationale=(vparsed.rationale or "")[:300],
+                rationale=rationale,
             )
 
         vote_items = await asyncio.gather(*[_one_vote(a) for a in AGENTS])
@@ -1103,10 +894,9 @@ async def run_post_debate_phases(
             {"role": "system", "content": SYNTH_SYSTEM},
             {"role": "user", "content": synth_user},
         ],
-        model,
+        synth_model,
         llm,
     )
-    synth_kw = _completion_kw_for_messages(base_kw, synth_msgs, llm, 4096)
 
     win_title = id_to_title.get(winning_option_id or "", "Options")
     base_ranked = [
@@ -1118,12 +908,12 @@ async def run_post_debate_phases(
     ]
 
     try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model,
-                response_format={"type": "json_object"},
+        _, resp = await asyncio.wait_for(
+            _create_json_completion(
+                client,
+                models=synth_models,
                 messages=synth_msgs,
-                **synth_kw,
+                llm=llm,
             ),
             timeout=float(SYNTH_API_TIMEOUT_SEC),
         )
@@ -1203,6 +993,7 @@ async def run_debate_stream(
     transcript = ""
     base_kw = llm.common_completion_kwargs()
     primary_kw = _primary_debate_kwargs(base_kw)
+    debate_model = llm.resolved_debate_model(model)
 
     yield {
         "type": "session_start",
@@ -1231,6 +1022,7 @@ async def run_debate_stream(
     random.shuffle(rotation_order)
     rr = 0
     turn_index = 0
+    last_primary_speech = ""
     while not _debate_deadline_elapsed(t0, debate_budget_sec):
         agent = rotation_order[rr % n_agents]
         rr += 1
@@ -1242,13 +1034,14 @@ async def run_debate_stream(
             "turn": turn_index,
         }
 
-        user_content = f"Decision context:\n{context}\n\n"
+        # Plain prose only — labeled headers like "Decision context:" get echoed into speech by models.
+        user_parts: list[str] = [context.strip()]
         if transcript.strip():
-            user_content += f"Debate so far:\n{_scrub_transcript_tail_for_prompt(transcript)}\n"
-        user_content += _timed_debate_user_block(turn_index)
+            user_parts.append(_scrub_transcript_tail_for_prompt(transcript))
+        user_content = "\n\n".join(user_parts) + "\n\n" + _timed_debate_user_block(turn_index)
 
         stream = await client.chat.completions.create(
-            model=model,
+            model=debate_model,
             stream=True,
             messages=prepare_chat_messages(
                 [
@@ -1258,7 +1051,7 @@ async def run_debate_stream(
                     },
                     {"role": "user", "content": user_content},
                 ],
-                model,
+                debate_model,
                 llm,
             ),
             **primary_kw,
@@ -1286,40 +1079,37 @@ async def run_debate_stream(
         # disable extra_body but providers may still omit content — salvage from reasoning for display.
         if not raw and (full_reasoning or "").strip():
             raw = _strip_transcript_artifacts(full_reasoning.strip())
-        # Sentence-filter the raw stream first — paragraph strip alone drops mixed meta+speech blocks entirely.
-        full_trimmed = _keep_first_non_meta_sentences(raw, 3)
-        if not full_trimmed.strip():
-            full_trimmed = _keep_first_non_meta_sentences(_strip_primary_speech_meta(full), 3)
-        if not full_trimmed.strip():
-            full_trimmed = _trim_to_max_sentences(_strip_primary_speech_meta(full), 3)
-        full_trimmed = _strip_primary_speech_meta(full_trimmed).strip() or full_trimmed.strip()
-        if _text_still_meta_ridden(full_trimmed) or len(full_trimmed.strip()) < 12:
-            alt = _salvage_quoted_speech(full)
+
+        full_trimmed = _normalize_spoken_line(raw, 3)
+        if not full_trimmed.strip() or len(full_trimmed.strip()) < 12:
+            alt = _salvage_quoted_speech(full) or _salvage_quoted_speech(full_reasoning or "")
             if alt:
-                full_trimmed = (
-                    _keep_first_non_meta_sentences(alt, 3) or _trim_to_max_sentences(alt, 3)
-                )
+                full_trimmed = _normalize_spoken_line(alt, 3)
         if _is_degenerate_repetitive_output(full_trimmed):
-            retry = _keep_first_non_meta_sentences(raw, 3)
-            if not _is_degenerate_repetitive_output(retry):
-                full_trimmed = _strip_primary_speech_meta(retry).strip() or retry.strip()
+            q = _salvage_quoted_speech(full or "")
+            if q and not _is_degenerate_repetitive_output(_normalize_spoken_line(q, 3)):
+                full_trimmed = _normalize_spoken_line(q, 3)
             else:
-                q = _salvage_quoted_speech(full)
-                if q and not _is_degenerate_repetitive_output(q):
-                    full_trimmed = _keep_first_non_meta_sentences(q, 3) or _trim_to_max_sentences(q, 3)
+                full_trimmed = ""
         if _is_degenerate_repetitive_output(full_trimmed):
             full_trimmed = ""
         if _looks_like_moderator_echo(full_trimmed):
             full_trimmed = ""
-        # Last resort: visible reply never empty when the model only streamed reasoning/trace text.
+        # Last resort when content is empty but reasoning exists: short in-character salvage only.
         if not (full_trimmed or "").strip() and (full_reasoning or "").strip():
             fr = full_reasoning.strip()
-            cand = (
-                _trim_to_max_sentences(_strip_primary_speech_meta(fr), 4).strip()
-                or _trim_to_max_sentences(fr, 4).strip()
-                or fr[:2400]
-            )
-            full_trimmed = cand
+            cand = _normalize_spoken_line(fr, 4).strip()
+            if (
+                cand
+                and len(cand) >= 24
+                and not _looks_like_moderator_echo(cand)
+                and len(cand) <= 900
+            ):
+                full_trimmed = cand
+        if last_primary_speech and _is_near_duplicate_primary(last_primary_speech, full_trimmed):
+            full_trimmed = ""
+        if (full_trimmed or "").strip():
+            last_primary_speech = full_trimmed.strip()
         yield {
             "type": "agent_end",
             "agent": agent["id"],
@@ -1352,7 +1142,7 @@ async def run_debate_stream(
                 try:
                     t = await _interjection_reply(
                         client,
-                        model=model,
+                        model=debate_model,
                         kw=ij_kw,
                         llm=llm,
                         context=context,

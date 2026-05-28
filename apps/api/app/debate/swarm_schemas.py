@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -23,12 +24,18 @@ SWARM_JSON_RULES = (
     "Include only the payload fields needed for that action. "
     "Optional: \"speech\" (short public line, max ~400 chars for transcript when action is not utter), "
     "\"rationale_internal\" (max 300 chars, not shown to users). "
-    "For utter: required \"text\" (what you say). "
+    "For utter: required \"text\" (natural spoken line at the table; no JSON or meta about instructions). "
     "For support_option/attack_option: \"option_id\", \"delta\" (number). "
     "For propose_claim: \"text\"; optional \"option_ids\" array. "
     "For link: \"src_claim_id\", \"dst_claim_id\", \"rel\" in supports|attacks|relates. "
-    "Use only option and claim ids from the observation. If unsure, use action pass."
+    "Use only option and claim ids from the observation. "
+    "Prefer action utter with a full spoken opinion (1–3 sentences). "
+    "Use support_option/attack_option only with a substantive \"speech\" line—not just \"option 0\". "
+    "Use pass only when you have nothing new to add."
 )
+
+_LOW_VALUE_SPEECH_RE = re.compile(r"^option\s*\d+\s*$", re.IGNORECASE)
+_LINK_ONLY_SPEECH_RE = re.compile(r"^c\d+_\d+\s*(?:→|->)\s*c\d+_\d+\s*$", re.IGNORECASE)
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -174,6 +181,24 @@ def swarm_response_to_agent_action(resp: SwarmTurnResponse, agent_id: str) -> Ag
             rel=resp.rel or "relates",
         )
     return PassAction(agent_id=agent_id)
+
+
+def user_visible_turn_line(resp: SwarmTurnResponse, applied: AgentAction) -> str | None:
+    """Text to show in the UI; None means skip (pass, bare option id, internal graph ops)."""
+    if isinstance(applied, PassAction):
+        return None
+    if isinstance(applied, UtterAction):
+        text = applied.text.strip()
+        return text if text else None
+    if resp.speech and resp.speech.strip():
+        speech = resp.speech.strip()
+        if _LOW_VALUE_SPEECH_RE.match(speech) or _LINK_ONLY_SPEECH_RE.match(speech):
+            return None
+        return speech
+    if isinstance(applied, ProposeClaimAction):
+        text = applied.text.strip()
+        return text if len(text) >= 12 else None
+    return None
 
 
 def transcript_line_for_turn(resp: SwarmTurnResponse, applied: AgentAction) -> str:

@@ -1,25 +1,47 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hiivbuddy
+      POSTGRES_PASSWORD: hiivbuddy
+      POSTGRES_DB: hiivbuddy
+    volumes:
+      - hiivbuddy_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+
   api:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    env_file:
-      - .env
-    volumes:
-      - hiivbuddy_data:/app/data
+    environment:
+      # DB is fixed for the Compose network; no root .env required for DATABASE_URL.
+      DATABASE_URL: postgresql://hiivbuddy:hiivbuddy@db:5432/hiivbuddy
+      # Copy repo-root `.env.example` → `.env` and set keys (Compose substitutes ${VAR} from that file if present).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLM_DEFAULT_MODEL: ${LLM_DEFAULT_MODEL:-}
+      LLM_DEBATE_MODEL: ${LLM_DEBATE_MODEL:-}
+      LLM_SYNTH_MODEL: ${LLM_SYNTH_MODEL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      JWT_SECRET: ${JWT_SECRET:-}
+    depends_on:
+      - db
 
   web:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      # If you see "bind: ... 3000 ... permitted", set WEB_HOST_PORT=3001 in `.env` or stop the other process.
+      - "${WEB_HOST_PORT:-3000}:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     depends_on:
       - api
 
 volumes:
-  hiivbuddy_data:
+  hiivbuddy_pgdata:

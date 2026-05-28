@@ -1,6 +1,6 @@
-# HiivBuddy
+# Hiiv
 
-HiivBuddy is a **decision helper** web app. You describe a real choice you’re facing (job offer, product direction, spend, etc.), and a small **panel of AI advisors** discusses it in a **timed session**—each turn is short (up to three sentences), others may **interject** in parallel, and the clock stops new debate turns before the final segment. After that, each advisor **votes** on concrete options. When enough of them agree, that feeds into a **final written report** with options, risks, and next steps. The **last 30 seconds** of the session length you choose are reserved for the **Chief Synthesizer** (closing analysis uses a single batched options/votes/stance pass when possible).
+Hiiv is a **decision helper** web app. You describe a real choice you’re facing (job offer, product direction, spend, etc.), and a small **panel of AI advisors** discusses it in a **timed session**—each turn is short (up to three sentences), others may **interject** in parallel, and the clock stops new debate turns before the final segment. After that, each advisor **votes** on concrete options. When enough of them agree, that feeds into a **final written report** with options, risks, and next steps. The **last 30 seconds** of the session length you choose are reserved for the **Chief Synthesizer** (closing analysis uses a single batched options/votes/stance pass when possible).
 
 It’s inspired by “swarm” style thinking: not one chatbot answer, but several perspectives that have to engage with each other before a summary.
 
@@ -8,11 +8,12 @@ It’s inspired by “swarm” style thinking: not one chatbot answer, but sever
 
 ## What you get
 
-- **Decision Room** — Paste your context, **attach** `.txt` / `.md` / `.pdf` (PDF text is extracted via the API), pick a model, and run the flow. **Export Markdown** downloads the current or saved session (context, transcript, votes, report).
+- **Marketing home (`/`)** — Public landing page with **Try demo** (guest session, no sign-up) and **Sign in** (`/login`).
+- **Decision Room** (`/decision-room`) — Paste your context, **attach** `.txt` / `.md` / `.pdf` (PDF text is extracted via the API), pick a model, and run the flow. **Export Markdown** downloads the current or saved session (context, transcript, votes, report).
 - **Timed debate** — You set **session length** (60–600 seconds). The API runs debate until the **debate budget** (`session_duration_sec − 30`) elapses, then runs vote + synthesis. Primary turns are capped at **three sentences**; optional **parallel interjections** after each speaker.
 - **Vote** — The system proposes a few clear options from the debate; each advisor picks one. You’ll see counts and whether a **consensus** threshold was met (default: 3 out of 5).
 - **Final report** — A structured summary: overview, ranked options, risks, suggested next steps.
-- **Saved runs** — Each completed run is stored locally in a small database file on the API side so you can build on this later (e.g. history screens).
+- **Saved runs** — Each completed run is stored in the API’s **PostgreSQL** database so you can build on this later (e.g. history screens).
 
 ---
 
@@ -45,7 +46,9 @@ Optional:
 1. Copy the example file:
    - From the **project root**, copy [`.env.example`](.env.example) to **`apps/api/.env`** (you can merge the API-related lines if you already use a root `.env` for Docker).
 
-2. Set at least **one** of:
+2. Set **`DATABASE_URL`** for **PostgreSQL** (required). Example values are in [`.env.example`](.env.example); with **`docker compose`** from the repo root, Postgres is exposed on host port **5435** (see `docker-compose.yml`).
+
+3. Set at least **one** of:
    - **`NVIDIA_API_KEY`** — for NVIDIA’s OpenAI-compatible API (common setup for this project).
    - **`OPENAI_API_KEY`** — for OpenAI or other providers that use the same style of client.
 
@@ -64,13 +67,15 @@ NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 
 If the API runs elsewhere, change this URL to match.
 
-**Docker:** put a **`.env`** in the **project root** (same folder as `docker-compose.yml`) with your keys; Compose loads it for the API service.
+**Guest demo:** `POST /auth/guest` issues a short-lived token for anonymous trials. **Try demo** requires Cloudflare Turnstile: set **`TURNSTILE_SECRET_KEY`** on the API and **`NEXT_PUBLIC_TURNSTILE_SITE_KEY`** on the web app (see [`.env.example`](.env.example) for test keys). For local dev without captcha, set **`GUEST_CAPTCHA_BYPASS=true`** in **`apps/api/.env`**. Also: **`GUEST_AUTH_ENABLED`**, **`GUEST_TOKEN_EXPIRE_MINUTES`** (default 240).
+
+**Docker:** optionally copy **`.env.example`** → **`.env`** in the **project root** and add **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**. Compose substitutes `${VAR}` values from that file into the API container when the file exists—it is **not** required for `docker compose up` to start (the stack still needs real keys in `.env` or your shell for the API to answer debates).
 
 ---
 
 ## Run commands (local development)
 
-Open **two terminals** from the **project root** (`HiivBuddy`).
+Open **two terminals** from the **project root** (`Hiiv`).
 
 **Terminal 1 — API**
 
@@ -131,7 +136,7 @@ docker compose up --build
 - Website: `http://localhost:3000`
 - API: `http://localhost:8000`
 
-Ensure **root** `.env` contains the variables the API needs (see [`.env.example`](.env.example)).
+Add a **root** `.env` (copy from [`.env.example`](.env.example)) with at least one LLM key. `DATABASE_URL` is set inside Compose for the API; you do not need to put it in `.env` for the default Docker stack.
 
 ---
 
@@ -142,7 +147,7 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 ### Vercel (frontend)
 
 1. Create a project from this repo and set **Root Directory** to **`apps/web`** (Framework Preset: Next.js).
-2. In **Project → Settings → Environment Variables**, set **`NEXT_PUBLIC_API_URL`** to your public API base URL (HTTPS, **no trailing slash**), e.g. `https://hiivbuddy-api.onrender.com`.
+2. In **Project → Settings → Environment Variables**, set **`NEXT_PUBLIC_API_URL`** to your public API base URL (HTTPS, **no trailing slash**), e.g. `https://hiiv-api.onrender.com`.
 3. Deploy. Preview deployments get their own `*.vercel.app` URLs; add each origin you use to **`CORS_ORIGINS`** on the API (see below), or use your production Vercel domain only.
 
 ### API on Render, Railway, Fly.io, etc.
@@ -153,7 +158,7 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
    (Or rely on the included **[`apps/api/Procfile`](apps/api/Procfile)** if your host supports it.)
 3. Set the same secrets as local development: **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**, **`LLM_DEFAULT_MODEL`**, and any other variables from [`.env.example`](.env.example).
 4. Set **`CORS_ORIGINS`** to a comma-separated list of allowed browser origins, e.g. `https://your-app.vercel.app,https://www.yourdomain.com`. Local **`http://localhost:3000`** is included by default on the API so you can still develop against a remote API if needed.
-5. **SQLite:** By default the database lives under **`apps/api/data`**. On many free hosts the filesystem is **ephemeral** (data can be lost on redeploy or sleep). For anything beyond demos, attach a **persistent disk** and set **`HIIVBUDDY_DATA_DIR`** to a path on that volume, or move to a managed database later.
+5. **PostgreSQL:** Create a **PostgreSQL** instance on your host (Render: **New → PostgreSQL**) and link it to the Web Service so **`DATABASE_URL`** is set automatically. For local development, run Postgres (e.g. **`docker compose up db`** from the repo root) and set **`DATABASE_URL`** in **`apps/api/.env`** as in [`.env.example`](.env.example).
 
 ---
 
@@ -168,7 +173,7 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 
 ## Product note
 
-The original product vision (broader roadmap: teams, long-term memory, billing, exports) lives in **`Hivvbuddy_PDD.pdf`** in this repo. This codebase focuses on the **core loop**: timed debate → vote → report, with local persistence.
+The original product vision (broader roadmap: teams, long-term memory, billing, exports) lives in **`Hivvbuddy_PDD.pdf`** in this repo. This codebase focuses on the **core loop**: timed debate → vote → report, with persistence in PostgreSQL.
 
 ---
 

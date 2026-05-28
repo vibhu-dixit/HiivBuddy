@@ -1,22 +1,54 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import Image from "next/image";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { useAuth } from "../auth/AuthProvider";
+import { DEMO_SAMPLE_CONTEXT } from "../components/landing/landingCopy";
 
 import { ChamberSeats } from "./ChamberSeats";
-import { DEBATE_AGENTS } from "./debateAgents";
 import { DebateTranscript } from "./DebateTranscript";
 import type { StoredDebate } from "./debateHistory";
-import { appendDebate, loadDebates, removeDebate } from "./debateHistory";
+import {
+  appendDebate,
+  clearDebatesForUser,
+  loadDebates,
+  removeDebate,
+} from "./debateHistory";
+import { isTurnVisibleToUser, sanitizeDebateTurnText } from "./displayDebateText";
 import { buildSessionMarkdown, downloadMarkdownFile } from "./sessionExportMarkdown";
 import type { Turn } from "./debateTypes";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 /** Must match API `MAX_EXTRACTED_CHARS` in context_ingest.py */
 const MAX_CONTEXT_CHARS = 65536;
+
+/** UI removed — fixed request shape; model IDs come from API `LLM_DEFAULT_MODEL` / tier env only. */
+const FIXED_CONSENSUS_THRESHOLD = 3;
+const FIXED_ENABLE_INTERJECTIONS = true;
+const FIXED_TRACK_ENVIRONMENT = false;
+const FIXED_SYNTH_ENV_SNAPSHOT = false;
+
+type SessionModeChoice = "classic" | "swarm";
+
+/** Default session mode (swarm). Set `NEXT_PUBLIC_DEFAULT_SESSION_MODE=classic` for streamed debate + interjections. */
+const DEFAULT_SESSION_MODE: SessionModeChoice =
+  process.env.NEXT_PUBLIC_DEFAULT_SESSION_MODE === "classic" ? "classic" : "swarm";
+
+/** Inclusive random length per run (API still clamps 60–600). */
+function randomSessionDurationSec(): number {
+  return 120 + Math.floor(Math.random() * (200 - 120 + 1));
+}
 
 function authHeaders(token: string, extra?: HeadersInit): HeadersInit {
   return { ...extra, Authorization: `Bearer ${token}` };
@@ -85,6 +117,7 @@ type EnvSnapshotEvent = {
   phase: string;
   snapshot: unknown;
 };
+type StreamError = { type: "stream_error"; message: string };
 type Saved = { type: "saved"; run_id: number };
 type Done = { type: "done"; run_id?: number };
 
@@ -104,6 +137,7 @@ type StreamEvent =
   | SynthesizerStart
   | FinalReport
   | EnvSnapshotEvent
+  | StreamError
   | Saved
   | Done
   | { type: string; [k: string]: unknown };
@@ -143,28 +177,42 @@ function formatSavedAt(iso: string): string {
   }
 }
 
-export default function DecisionRoomPage() {
+function DecisionRoomContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { token, user, loading: authLoading, logout } = useAuth();
+  const isGuest = Boolean(user?.isGuest);
 
   useEffect(() => {
     if (!authLoading && (!token || !user)) {
-      router.replace("/");
+      router.replace("/login");
     }
   }, [authLoading, token, user, router]);
 
   useEffect(() => {
     if (!user) return;
+    if (isGuest) {
+      clearDebatesForUser(user.userId);
+      setDebateHistory([]);
+      setSelectedArchiveId(null);
+      return;
+    }
     setDebateHistory(loadDebates(user.userId));
-  }, [user]);
+  }, [user, isGuest]);
 
   const [context, setContext] = useState("");
-  const [model, setModel] = useState(
-    () => process.env.NEXT_PUBLIC_DEFAULT_MODEL ?? "stepfun-ai/step-3.5-flash",
-  );
-  const [sessionDurationInput, setSessionDurationInput] = useState("120");
-  const [consensusThreshold, setConsensusThreshold] = useState(3);
-  const [enableInterjections, setEnableInterjections] = useState(true);
+
+  /** Guest demo: always restore sample scenario after refresh (URL often loses ?demo=1). */
+  useEffect(() => {
+    if (authLoading || !user) return;
+    if (isGuest) {
+      setContext((current) => (current.trim().length === 0 ? DEMO_SAMPLE_CONTEXT : current));
+      return;
+    }
+    if (searchParams.get("demo") === "1") {
+      setContext((current) => (current.trim().length === 0 ? DEMO_SAMPLE_CONTEXT : current));
+    }
+  }, [authLoading, user, isGuest, searchParams]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -181,19 +229,22 @@ export default function DecisionRoomPage() {
   } | null>(null);
   const [debatePhaseOver, setDebatePhaseOver] = useState(false);
   const [report, setReport] = useState<ReportState | null>(null);
-  const [sessionMode, setSessionMode] = useState<"classic" | "swarm">("classic");
-  const [trackEnvironment, setTrackEnvironment] = useState(false);
-  const [synthEnvSnapshot, setSynthEnvSnapshot] = useState(false);
   const [environmentPeek, setEnvironmentPeek] = useState<{
     phase: string;
     snapshot: unknown;
   } | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
+  /** True after vote phase ends until final_report arrives (Chief Synthesizer HTTP call). */
+  const [chiefSynthPending, setChiefSynthPending] = useState(false);
   const [voteOptions, setVoteOptions] = useState<VoteOptions["options"] | null>(null);
   const [voteTally, setVoteTally] = useState<VoteTally | null>(null);
   const [streamingAgentId, setStreamingAgentId] = useState<string | null>(null);
+  /** Swarm mode has no token stream; keep seat ring lit briefly after each turn. */
+  const [floorAgentId, setFloorAgentId] = useState<string | null>(null);
   const [flashAgentId, setFlashAgentId] = useState<string | null>(null);
   const flashClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const floorClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runIdRef = useRef<number | null>(null);
   const debateScrollRef = useRef<HTMLDivElement | null>(null);
 
   const [debateHistory, setDebateHistory] = useState<StoredDebate[]>([]);
@@ -215,12 +266,14 @@ export default function DecisionRoomPage() {
     context: "",
     model: "",
     session_duration_sec: 120,
-    consensus_threshold: 3,
-    enable_interjections: true,
-    session_mode: "classic" as "classic" | "swarm",
-    track_environment: false,
-    synth_env_snapshot: false,
+    consensus_threshold: FIXED_CONSENSUS_THRESHOLD,
+    enable_interjections: FIXED_ENABLE_INTERJECTIONS,
+    session_mode: DEFAULT_SESSION_MODE satisfies SessionModeChoice,
+    track_environment: FIXED_TRACK_ENVIRONMENT,
+    synth_env_snapshot: FIXED_SYNTH_ENV_SNAPSHOT,
   });
+
+  const [sessionMode, setSessionMode] = useState<SessionModeChoice>(DEFAULT_SESSION_MODE);
 
   const clearFlashTimer = useCallback(() => {
     if (flashClearRef.current) {
@@ -229,7 +282,54 @@ export default function DecisionRoomPage() {
     }
   }, []);
 
-  useEffect(() => () => clearFlashTimer(), [clearFlashTimer]);
+  const clearFloorTimer = useCallback(() => {
+    if (floorClearRef.current) {
+      clearTimeout(floorClearRef.current);
+      floorClearRef.current = null;
+    }
+  }, []);
+
+  const pulseFloorAgent = useCallback(
+    (agentId: string, ms = 520) => {
+      clearFloorTimer();
+      setFloorAgentId(agentId);
+      floorClearRef.current = setTimeout(() => {
+        setFloorAgentId(null);
+        floorClearRef.current = null;
+      }, ms);
+    },
+    [clearFloorTimer],
+  );
+
+  useEffect(() => {
+    runIdRef.current = runId;
+  }, [runId]);
+
+  useEffect(() => {
+    if (!isGuest || !token) return;
+    const deleteEphemeralRun = () => {
+      const rid = runIdRef.current;
+      if (typeof rid !== "number") return;
+      void fetch(`${API_URL}/debate/runs/${rid}`, {
+        method: "DELETE",
+        headers: authHeaders(token),
+        keepalive: true,
+      });
+    };
+    window.addEventListener("pagehide", deleteEphemeralRun);
+    return () => {
+      window.removeEventListener("pagehide", deleteEphemeralRun);
+      deleteEphemeralRun();
+    };
+  }, [isGuest, token]);
+
+  useEffect(
+    () => () => {
+      clearFlashTimer();
+      clearFloorTimer();
+    },
+    [clearFlashTimer, clearFloorTimer],
+  );
 
   const canRun = useMemo(
     () => context.trim().length >= 10 && !running,
@@ -336,9 +436,10 @@ export default function DecisionRoomPage() {
   const agentHighlightId = useMemo(() => {
     if (synthesizerActive) return null;
     if (streamingAgentId) return streamingAgentId;
+    if (floorAgentId) return floorAgentId;
     if (flashAgentId) return flashAgentId;
     return activeMemberId;
-  }, [synthesizerActive, flashAgentId, streamingAgentId, activeMemberId]);
+  }, [synthesizerActive, flashAgentId, floorAgentId, streamingAgentId, activeMemberId]);
 
   const selectedArchive = useMemo(
     () => (selectedArchiveId ? debateHistory.find((d) => d.id === selectedArchiveId) : null),
@@ -402,20 +503,15 @@ export default function DecisionRoomPage() {
       downloadMarkdownFile(md, `hiivbuddy-${safe}`);
       return;
     }
-    const sessionDur = (() => {
-      const n = parseInt(sessionDurationInput.replace(/\D/g, ""), 10);
-      if (!Number.isFinite(n)) return 120;
-      return Math.min(600, Math.max(60, n));
-    })();
     const md = buildSessionMarkdown({
       context,
-      model,
-      session_duration_sec: sessionDur,
-      consensus_threshold: consensusThreshold,
-      enable_interjections: enableInterjections,
-      session_mode: sessionMode,
-      track_environment: trackEnvironment,
-      synth_env_snapshot: synthEnvSnapshot,
+      model: lastSessionMeta.current.model,
+      session_duration_sec: lastSessionMeta.current.session_duration_sec,
+      consensus_threshold: FIXED_CONSENSUS_THRESHOLD,
+      enable_interjections: FIXED_ENABLE_INTERJECTIONS,
+      session_mode: lastSessionMeta.current.session_mode,
+      track_environment: FIXED_TRACK_ENVIRONMENT,
+      synth_env_snapshot: FIXED_SYNTH_ENV_SNAPSHOT,
       savedAt: new Date().toISOString(),
       turns,
       voteOptions,
@@ -428,13 +524,6 @@ export default function DecisionRoomPage() {
   }, [
     selectedArchive,
     context,
-    model,
-    sessionDurationInput,
-    consensusThreshold,
-    enableInterjections,
-    sessionMode,
-    trackEnvironment,
-    synthEnvSnapshot,
     turns,
     voteOptions,
     voteTally,
@@ -461,7 +550,7 @@ export default function DecisionRoomPage() {
   ]);
 
   useEffect(() => {
-    if (running) return;
+    if (isGuest || running) return;
     const seq = runSeq.current;
     if (seq <= savedUpToSeq.current) return;
     const hasBody =
@@ -504,7 +593,13 @@ export default function DecisionRoomPage() {
     if (!user) return;
     appendDebate(user.userId, entry);
     setDebateHistory(loadDebates(user.userId));
-  }, [running, turns, voteTally, report, voteOptions, error, user]);
+  }, [isGuest, running, turns, voteTally, report, voteOptions, error, user]);
+
+  const applySanitizedTurnText = useCallback((raw: string): string | null => {
+    if (!isTurnVisibleToUser(raw)) return null;
+    const { text } = sanitizeDebateTurnText(raw);
+    return text;
+  }, []);
 
   const handleDeleteArchive = useCallback(
     async (d: StoredDebate) => {
@@ -538,6 +633,7 @@ export default function DecisionRoomPage() {
     pendingServerRunIdRef.current = null;
     setSelectedArchiveId(null);
     setRunning(true);
+    setChiefSynthPending(false);
     setError(null);
     setTurns([]);
     setCurrentAgent(null);
@@ -553,21 +649,17 @@ export default function DecisionRoomPage() {
     clearFlashTimer();
     setNowMs(Date.now());
 
-    const sessionDur = (() => {
-      const n = parseInt(sessionDurationInput.replace(/\D/g, ""), 10);
-      if (!Number.isFinite(n)) return 120;
-      return Math.min(600, Math.max(60, n));
-    })();
+    const sessionDur = randomSessionDurationSec();
 
     lastSessionMeta.current = {
       context,
-      model,
+      model: "",
       session_duration_sec: sessionDur,
-      consensus_threshold: consensusThreshold,
-      enable_interjections: enableInterjections,
+      consensus_threshold: FIXED_CONSENSUS_THRESHOLD,
+      enable_interjections: FIXED_ENABLE_INTERJECTIONS,
       session_mode: sessionMode,
-      track_environment: trackEnvironment,
-      synth_env_snapshot: synthEnvSnapshot,
+      track_environment: FIXED_TRACK_ENVIRONMENT,
+      synth_env_snapshot: FIXED_SYNTH_ENV_SNAPSHOT,
     };
 
     if (!token) {
@@ -576,63 +668,20 @@ export default function DecisionRoomPage() {
       return;
     }
 
-    // #region agent log
-    fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
-      body: JSON.stringify({
-        sessionId: "148c8e",
-        location: "decision-room/page.tsx:runDebate",
-        message: "debate_run_start",
-        data: {
-          hypothesisId: "C",
-          selectedArchiveId,
-          contextLen: context.length,
-          modelIdLen: model.length,
-          sessionMode,
-          apiBase: API_URL,
-        },
-        timestamp: Date.now(),
-        runId: "debate",
-      }),
-    }).catch(() => {});
-    // #endregion
-
     try {
       const res = await fetch(`${API_URL}/debate/stream`, {
         method: "POST",
         headers: authHeaders(token, { "Content-Type": "application/json" }),
         body: JSON.stringify({
           context,
-          model,
           session_duration_sec: sessionDur,
-          consensus_threshold: consensusThreshold,
-          enable_interjections: enableInterjections,
+          consensus_threshold: FIXED_CONSENSUS_THRESHOLD,
+          enable_interjections: FIXED_ENABLE_INTERJECTIONS,
           session_mode: sessionMode,
-          track_environment: trackEnvironment,
-          synth_env_snapshot: synthEnvSnapshot,
+          track_environment: FIXED_TRACK_ENVIRONMENT,
+          synth_env_snapshot: FIXED_SYNTH_ENV_SNAPSHOT,
         }),
       });
-
-      // #region agent log
-      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
-        body: JSON.stringify({
-          sessionId: "148c8e",
-          location: "decision-room/page.tsx:runDebate",
-          message: "debate_fetch_response",
-          data: {
-            hypothesisId: "A",
-            ok: res.ok,
-            status: res.status,
-            ct: res.headers.get("content-type") ?? "",
-          },
-          timestamp: Date.now(),
-          runId: "debate",
-        }),
-      }).catch(() => {});
-      // #endregion
 
       if (!res.ok) {
         const t = await res.text();
@@ -644,15 +693,10 @@ export default function DecisionRoomPage() {
 
       const decoder = new TextDecoder();
       let carry = "";
-      let chunkReads = 0;
-      let parsedEvents = 0;
-      let firstEvType: string | null = null;
-      let nonemptyUnparsedBlocks = 0;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        chunkReads += 1;
         carry += decoder.decode(value, { stream: true });
         // Normalize CRLF so SSE event boundaries (\n\n) split correctly (HTTP often uses \r\n).
         carry = carry.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -662,12 +706,7 @@ export default function DecisionRoomPage() {
 
         for (const block of parts) {
           const ev = parseSseBlock(block);
-          if (!ev) {
-            if (block.trim().length > 0) nonemptyUnparsedBlocks += 1;
-            continue;
-          }
-          parsedEvents += 1;
-          if (firstEvType === null) firstEvType = ev.type;
+          if (!ev) continue;
 
           switch (ev.type) {
             case "session_start": {
@@ -688,6 +727,8 @@ export default function DecisionRoomPage() {
               const tn = typeof e.turn === "number" ? e.turn : 1;
               setFlashAgentId(null);
               clearFlashTimer();
+              clearFloorTimer();
+              setFloorAgentId(e.agent);
               setCurrentAgent({ id: e.agent, name: e.name, turn: tn });
               setTurns((prev) => [
                 ...prev,
@@ -702,24 +743,13 @@ export default function DecisionRoomPage() {
               ]);
               break;
             }
-            case "reasoning_token": {
-              const e = ev as ReasoningToken;
-              setStreamingAgentId(e.agent);
-              setTurns((prev) => {
-                if (prev.length === 0) return prev;
-                const next = [...prev];
-                const last = next[next.length - 1];
-                if (last.agent === e.agent) {
-                  const rr = (last.reasoning ?? "") + e.text;
-                  next[next.length - 1] = { ...last, reasoning: rr };
-                }
-                return next;
-              });
+            case "reasoning_token":
+              /* Reasoning/thinking traces not shown in UI; skip accumulating. */
               break;
-            }
             case "token": {
               const e = ev as Token;
               setStreamingAgentId(e.agent);
+              setFloorAgentId(e.agent);
               setTurns((prev) => {
                 if (prev.length === 0) return prev;
                 const next = [...prev];
@@ -735,21 +765,26 @@ export default function DecisionRoomPage() {
               const e = ev as AgentEnd;
               setCurrentAgent(null);
               setStreamingAgentId(null);
+              pulseFloorAgent(e.agent);
               // Always replace streamed tokens with server-cleaned text (including ""), or raw meta stays visible.
               if (typeof e.full_text === "string") {
+                const cleaned = applySanitizedTurnText(e.full_text);
                 setTurns((prev) => {
                   if (prev.length === 0) return prev;
+                  if (cleaned === null) {
+                    const last = prev[prev.length - 1];
+                    if (last.agent === e.agent) {
+                      return prev.slice(0, -1);
+                    }
+                    return prev;
+                  }
                   const next = [...prev];
                   const last = next[next.length - 1];
                   if (last.agent === e.agent) {
-                    const r =
-                      typeof e.reasoning_text === "string" && e.reasoning_text.length > 0
-                        ? e.reasoning_text
-                        : last.reasoning ?? "";
                     next[next.length - 1] = {
                       ...last,
-                      text: e.full_text,
-                      reasoning: r,
+                      text: cleaned,
+                      reasoning: "",
                     };
                   }
                   return next;
@@ -766,18 +801,22 @@ export default function DecisionRoomPage() {
                 setFlashAgentId(null);
                 flashClearRef.current = null;
               }, 2500);
-              setTurns((prev) => [
-                ...prev,
-                {
-                  kind: "interjection",
-                  agent: e.agent,
-                  name: e.name,
-                  turn: e.turn,
-                  text: e.text,
-                  targetAgent: e.target_agent,
-                  targetName: e.target_name,
-                },
-              ]);
+              setTurns((prev) => {
+                const cleaned = applySanitizedTurnText(e.text);
+                if (cleaned === null) return prev;
+                return [
+                  ...prev,
+                  {
+                    kind: "interjection",
+                    agent: e.agent,
+                    name: e.name,
+                    turn: e.turn,
+                    text: cleaned,
+                    targetAgent: e.target_agent,
+                    targetName: e.target_name,
+                  },
+                ];
+              });
               break;
             }
             case "vote_options":
@@ -795,6 +834,7 @@ export default function DecisionRoomPage() {
               setStreamingAgentId(null);
               setFlashAgentId(null);
               clearFlashTimer();
+              setChiefSynthPending(true);
               setCurrentAgent({ id: "synthesizer", name: "Chief Synthesizer" });
               break;
             case "final_report": {
@@ -804,6 +844,7 @@ export default function DecisionRoomPage() {
                   ? { ...e.report, env_snapshot: e.env_snapshot }
                   : e.report,
               );
+              setChiefSynthPending(false);
               setEnvironmentPeek(null);
               setCurrentAgent(null);
               break;
@@ -819,74 +860,29 @@ export default function DecisionRoomPage() {
               if (typeof e.run_id === "number") setRunId(e.run_id);
               break;
             }
+            case "stream_error": {
+              const e = ev as StreamError;
+              setError(e.message || "The session ended unexpectedly.");
+              break;
+            }
             default:
               break;
           }
         }
       }
 
-      // #region agent log
-      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
-        body: JSON.stringify({
-          sessionId: "148c8e",
-          location: "decision-room/page.tsx:runDebate",
-          message: "debate_stream_complete",
-          data: {
-            hypothesisId: "B",
-            chunkReads,
-            parsedEvents,
-            firstEvType,
-            nonemptyUnparsedBlocks,
-            carryRemainLen: carry.length,
-          },
-          timestamp: Date.now(),
-          runId: "debate",
-        }),
-      }).catch(() => {});
-      // #endregion
     } catch (e) {
-      // #region agent log
-      const err = e instanceof Error ? e : new Error(String(e));
-      fetch("http://127.0.0.1:7318/ingest/8090b01d-fd1e-43b0-8cc1-682d372ce008", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "148c8e" },
-        body: JSON.stringify({
-          sessionId: "148c8e",
-          location: "decision-room/page.tsx:runDebate",
-          message: "debate_stream_error",
-          data: {
-            hypothesisId: "A",
-            errorName: err.name,
-            errorMessage: err.message.slice(0, 300),
-          },
-          timestamp: Date.now(),
-          runId: "debate",
-        }),
-      }).catch(() => {});
-      // #endregion
+      setChiefSynthPending(false);
       setError(e instanceof Error ? e.message : "Request failed");
     } finally {
       setRunning(false);
+      setChiefSynthPending(false);
       setCurrentAgent(null);
       setStreamingAgentId(null);
       setFlashAgentId(null);
       clearFlashTimer();
     }
-  }, [
-    context,
-    model,
-    sessionDurationInput,
-    consensusThreshold,
-    enableInterjections,
-    sessionMode,
-    trackEnvironment,
-    synthEnvSnapshot,
-    clearFlashTimer,
-    token,
-    selectedArchiveId,
-  ]);
+  }, [context, applySanitizedTurnText, clearFlashTimer, pulseFloorAgent, clearFloorTimer, token, sessionMode]);
 
   if (authLoading || !token || !user) {
     return (
@@ -897,26 +893,56 @@ export default function DecisionRoomPage() {
   }
 
   return (
-    <main className="mx-auto box-border flex min-h-0 w-full max-w-[min(100%,92rem)] flex-1 flex-col gap-4 overflow-y-auto p-6">
-      <header className="shrink-0 flex flex-col gap-3 border-b border-white/10 pb-4 sm:flex-row sm:items-start sm:justify-between">
+    <main className="mx-auto box-border flex min-h-0 w-full max-w-[min(100%,92rem)] flex-1 flex-col gap-4 overflow-hidden p-4 sm:p-6">
+      {isGuest && (
+        <div className="shrink-0 rounded-lg border border-[var(--accent)]/30 bg-[var(--accent-muted)] px-4 py-3 text-sm text-[var(--foreground)]">
+          You&apos;re in demo mode.{" "}
+          <Link href="/login" className="font-medium text-[var(--accent)] underline hover:text-[var(--accent-hover)]">
+            Sign up
+          </Link>{" "}
+          to save your sessions and history.
+        </div>
+      )}
+      <header className="shrink-0 flex flex-col gap-3 border-b border-[var(--border)] pb-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Decision Room</h1>
+          <div className="flex items-center gap-2">
+            <Link href="/" className="shrink-0">
+              <Image
+                src="/logo.png"
+                alt="Hiiv home"
+                width={32}
+                height={32}
+                className="h-8 w-8 rounded-lg"
+              />
+            </Link>
+            <h1 className="text-xl font-semibold tracking-tight">Decision Room</h1>
+          </div>
           <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--muted)]">
-            Timed debate (max three sentences per turn), optional interjections, then vote and Chief Synthesizer
-            in the last {sessionClock?.synth_reserve_sec ?? 30}s of the session.
+            {isGuest ? (
+              <>
+                Your panel will deliberate for a few minutes, vote on the clearest paths, then deliver a
+                decision brief. Edit the sample scenario below or paste your own.
+              </>
+            ) : (
+              <>
+                Timed panel session (about two to three minutes). Each advisor speaks in short turns, then
+                the room votes and produces a structured brief. Closing synthesis uses the last{" "}
+                {sessionClock?.synth_reserve_sec ?? 30}s of the session clock.
+              </>
+            )}
           </p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2 sm:flex-row sm:items-center sm:gap-4">
-          <span className="text-xs text-[var(--muted)]">{user.username}</span>
+          {!isGuest && <span className="text-xs text-[var(--muted)]">{user.username}</span>}
           <button
             type="button"
             onClick={() => {
               logout();
-              router.replace("/");
+              router.replace(isGuest ? "/" : "/login");
             }}
             className="text-sm text-[var(--muted)] hover:text-[var(--foreground)]"
           >
-            Log out
+            {isGuest ? "End demo" : "Log out"}
           </button>
           <Link href="/" className="text-sm text-[var(--muted)] hover:text-[var(--foreground)]">
             Home
@@ -925,7 +951,7 @@ export default function DecisionRoomPage() {
       </header>
 
       {/* Mobile: chamber → history → form → debate. Desktop: chamber+timer | history; debate | form */}
-      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_minmax(320px,440px)] lg:grid-rows-[auto_minmax(0,1fr)] lg:gap-6">
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_minmax(320px,440px)] lg:grid-rows-[auto_minmax(0,1fr)] lg:gap-6">
         {/* Row 1 col 1 — Chamber + debate-phase timer bottom-right */}
         <aside className="order-1 flex min-h-0 min-w-0 flex-col lg:col-start-1 lg:row-start-1">
           <ChamberSeats
@@ -952,7 +978,8 @@ export default function DecisionRoomPage() {
           />
         </aside>
 
-        {/* Row 1 col 2 — History (wider panel) */}
+        {/* Row 1 col 2 — History (registered users only; demo sessions are ephemeral) */}
+        {!isGuest && (
         <section
           className="order-2 flex max-h-40 min-h-0 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-2 lg:row-start-1 lg:max-h-none lg:min-h-0 lg:self-stretch"
           aria-label="Saved debates"
@@ -992,6 +1019,11 @@ export default function DecisionRoomPage() {
                   >
                     <span className="block text-[10px] uppercase tracking-wide text-[var(--muted)]">
                       {formatSavedAt(d.savedAt)}
+                      {d.session_mode || d.debate_mode ? (
+                        <span className="ml-1.5 normal-case text-[var(--accent)]">
+                          · {(d.session_mode ?? d.debate_mode) === "swarm" ? "swarm" : "classic"}
+                        </span>
+                      ) : null}
                     </span>
                     <span className="mt-0.5 line-clamp-2 break-words leading-snug">
                       {previewContext(d.context, 72)}
@@ -1030,10 +1062,11 @@ export default function DecisionRoomPage() {
             </ul>
           </nav>
         </section>
+        )}
 
         {/* Row 2 col 1 — Debate transcript (full width of column) */}
         <section
-          className="order-4 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-1 lg:row-start-2"
+          className="order-4 flex min-h-[min(42vh,360px)] min-w-0 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-1 lg:row-start-2 lg:min-h-0 lg:self-stretch"
           aria-label="Debate transcript"
         >
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-b border-white/10 px-3 py-2">
@@ -1059,14 +1092,20 @@ export default function DecisionRoomPage() {
             voteOptions={displayVoteOptions}
             voteTally={displayVoteTally}
             report={displayReport}
+            chiefSynthPending={selectedArchive ? false : chiefSynthPending}
             environmentPeek={displayEnvironmentPeek}
+            hideTechnical={isGuest}
             runId={selectedArchive ? null : runId}
             debateScrollRef={debateScrollRef}
           />
         </section>
 
         {/* Row 2 col 2 — Context & controls */}
-        <section className="order-3 flex min-h-0 flex-col gap-4 lg:col-start-2 lg:row-start-2">
+        <section
+          className={`order-3 flex min-h-0 flex-col gap-4 overflow-y-auto lg:col-start-2 lg:max-h-full lg:self-stretch ${
+            isGuest ? "lg:row-start-1" : "lg:row-start-2"
+          }`}
+        >
           <div className="flex shrink-0 flex-col gap-3 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
             <div className="flex w-full flex-col gap-2">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -1141,95 +1180,23 @@ export default function DecisionRoomPage() {
             </div>
 
             <div className="flex flex-wrap items-end gap-4">
-              <label className="flex flex-col gap-1">
-                <span className="text-xs text-[var(--muted)]">Model</span>
-                <input
-                  className="rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  disabled={running}
-                />
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-xs text-[var(--muted)]">Session (sec)</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  autoComplete="off"
-                  className="w-24 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-                  value={sessionDurationInput}
-                  onChange={(e) => {
-                    const raw = e.target.value.replace(/\D/g, "");
-                    setSessionDurationInput(raw);
-                  }}
-                  onBlur={() => {
-                    if (sessionDurationInput === "") {
-                      setSessionDurationInput("120");
-                      return;
-                    }
-                    const n = parseInt(sessionDurationInput, 10);
-                    const clamped = Number.isFinite(n)
-                      ? Math.min(600, Math.max(60, n))
-                      : 120;
-                    setSessionDurationInput(String(clamped));
-                  }}
-                  disabled={running}
-                />
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-xs text-[var(--muted)]">Consensus (votes)</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={DEBATE_AGENTS.length}
-                  className="w-20 rounded-lg border border-white/10 bg-[var(--card)] px-3 py-2 text-sm"
-                  value={consensusThreshold}
-                  onChange={(e) => setConsensusThreshold(Number(e.target.value) || 3)}
-                  disabled={running}
-                />
-              </label>
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="rounded border-white/20"
-                  checked={enableInterjections}
-                  onChange={(e) => setEnableInterjections(e.target.checked)}
-                  disabled={running}
-                />
-                <span className="text-[var(--muted)]">Parallel interjections</span>
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-xs text-[var(--muted)]">Session mode</span>
-                <select
-                  className="rounded-lg border border-white/10 bg-[var(--card)] px-2 py-1.5 text-sm"
-                  value={sessionMode}
-                  onChange={(e) => setSessionMode(e.target.value === "swarm" ? "swarm" : "classic")}
-                  disabled={running}
-                >
-                  <option value="classic">Classic (streaming lap debate)</option>
-                  <option value="swarm">Swarm (JSON turns + shared env)</option>
-                </select>
-              </label>
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="rounded border-white/20"
-                  checked={trackEnvironment}
-                  onChange={(e) => setTrackEnvironment(e.target.checked)}
-                  disabled={running}
-                />
-                <span className="text-[var(--muted)]">Track environment</span>
-              </label>
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="rounded border-white/20"
-                  checked={synthEnvSnapshot}
-                  onChange={(e) => setSynthEnvSnapshot(e.target.checked)}
-                  disabled={running}
-                />
-                <span className="text-[var(--muted)]">Synthesizer env JSON</span>
-              </label>
+              {!isGuest && (
+                <div className="flex min-w-[min(100%,14rem)] flex-col gap-1">
+                  <label htmlFor="session-mode" className="text-xs font-medium text-[var(--muted)]">
+                    Session mode
+                  </label>
+                  <select
+                    id="session-mode"
+                    value={sessionMode}
+                    onChange={(e) => setSessionMode(e.target.value as SessionModeChoice)}
+                    disabled={running}
+                    className="rounded-lg border border-[var(--border)] bg-[var(--card)] px-2.5 py-2 text-sm text-[var(--foreground)] outline-none ring-[var(--accent)] focus:ring-2 disabled:opacity-40"
+                  >
+                    <option value="classic">Classic — dialogue with interjections</option>
+                    <option value="swarm">Structured panel turns</option>
+                  </select>
+                </div>
+              )}
               <div className="flex flex-col gap-1">
                 <button
                   type="button"
@@ -1257,5 +1224,19 @@ export default function DecisionRoomPage() {
         </section>
       </div>
     </main>
+  );
+}
+
+export default function DecisionRoomPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="flex min-h-screen flex-col items-center justify-center p-8">
+          <p className="text-sm text-[var(--muted)]">Loading…</p>
+        </main>
+      }
+    >
+      <DecisionRoomContent />
+    </Suspense>
   );
 }

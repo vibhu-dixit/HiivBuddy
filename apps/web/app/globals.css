@@ -3,14 +3,169 @@
 @tailwind utilities;
 
 :root {
-  --background: #0c0c0f;
-  --foreground: #e8e8ed;
-  --muted: #8b8b9a;
-  --card: #16161c;
-  --accent: #6366f1;
+  --background: #faf9f7;
+  --foreground: #1a1a1f;
+  --muted: #5c5c6b;
+  --card: #ffffff;
+  --border: #e8e6e1;
+  --accent: #0d9488;
+  --accent-hover: #0f766e;
+  --accent-muted: #ccfbf1;
+  --room-background: #f4f3f0;
+  --room-card: #ffffff;
+  --room-border: #ddd9d2;
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
+}
+
+.decision-room-shell {
+  --background: var(--room-background);
+  --card: var(--room-card);
+  --border: var(--room-border);
+}
+
+/* Landing page — hero + dark feature band */
+.landing-hero {
+  --landing-hero-bg: #0a1218;
+  --landing-hero-fg: #f4f2ed;
+  --landing-hero-muted: #9ca3af;
+  --landing-wire: rgba(148, 163, 184, 0.85);
+}
+
+@keyframes landing-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes landing-path-dash {
+  to {
+    stroke-dashoffset: -120;
+  }
+}
+
+@keyframes landing-preview-rise {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes landing-shimmer {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes landing-spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.landing-float {
+  animation: landing-float 5s ease-in-out infinite;
+}
+
+.landing-float-slow {
+  animation: landing-float 7s ease-in-out infinite;
+}
+
+.landing-float-delayed {
+  animation: landing-float 6s ease-in-out 1.2s infinite;
+}
+
+.landing-path-dash {
+  stroke-dasharray: 12 10;
+  animation: landing-path-dash 24s linear infinite;
+}
+
+.landing-preview-rise {
+  animation: landing-preview-rise 0.9s ease-out both;
+}
+
+.landing-shimmer {
+  animation: landing-shimmer 2s ease-in-out infinite;
+}
+
+.landing-spin-slow {
+  animation: landing-spin-slow 48s linear infinite;
+}
+
+@keyframes panel-blob-drift {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(12px, -16px);
+  }
+}
+
+@keyframes panel-blob-drift-reverse {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(-14px, 12px);
+  }
+}
+
+@keyframes panel-ring-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.25;
+  }
+  50% {
+    transform: scale(1.03);
+    opacity: 0.45;
+  }
+}
+
+.panel-blob-drift {
+  animation: panel-blob-drift 14s ease-in-out infinite;
+}
+
+.panel-blob-drift-reverse {
+  animation: panel-blob-drift-reverse 16s ease-in-out infinite;
+}
+
+.panel-ring-pulse {
+  animation: panel-ring-pulse 4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-float,
+  .landing-float-slow,
+  .landing-float-delayed,
+  .landing-path-dash,
+  .landing-preview-rise,
+  .landing-shimmer,
+  .landing-spin-slow,
+  .panel-blob-drift,
+  .panel-blob-drift-reverse,
+  .panel-ring-pulse {
+    animation: none;
+  }
+
 }

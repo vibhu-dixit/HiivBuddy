@@ -1,10 +1,10 @@
-# HiivBuddy — common tasks (works with GNU Make: macOS, Linux, Git Bash on Windows)
+# Hiiv — common tasks (works with GNU Make: macOS, Linux, Git Bash on Windows)
 # Windows without `make`: from repo root in PowerShell use .\dev-api.cmd and .\dev-web.cmd
 # (PowerShell requires .\ to run a script in the current directory.)
 .PHONY: help install install-api install-web dev-api dev-web build-web lint-web docker-up docker-down
 
 help:
-	@echo "HiivBuddy targets:"
+	@echo "Hiiv targets:"
 	@echo "  make install      - Install Python + Node dependencies"
 	@echo "  make install-api  - pip install (apps/api)"
 	@echo "  make install-web  - npm install (apps/web)"

@@ -12,12 +12,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 NVIDIA_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 
-def _looks_like_nvidia_host(base_url: str | None) -> bool:
-    if not base_url:
-        return False
-    return "nvidia.com" in base_url.lower()
-
-
 def _normalize_openai_base_url(url: str) -> str:
     """OpenAI SDK posts to {base_url}/chat/completions. Host-only URLs must include /v1 or the server returns 404."""
     u = url.strip().rstrip("/")
@@ -44,7 +38,12 @@ class Settings(BaseSettings):
         default="stepfun-ai/step-3.5-flash",
         description="Default chat model id for debate when not specified in the request",
     )
-    # None = auto: enable thinking when using NVIDIA (NVIDIA_API_KEY or nvidia host URL)
+    # Optional tier routing: when set, overrides the request `model` for high-volume debate turns
+    # (classic primary + interjections; swarm JSON turns). Falls back to request model when unset.
+    llm_debate_model: str | None = Field(default=None, alias="LLM_DEBATE_MODEL")
+    # Optional tier routing: when set, overrides the request `model` for closing JSON, votes, Chief Synthesizer.
+    llm_synth_model: str | None = Field(default=None, alias="LLM_SYNTH_MODEL")
+    # Default off for normal completions; set NVIDIA_ENABLE_THINKING=true for models that use reasoning streams.
     nvidia_enable_thinking: bool | None = Field(default=None)
     # None = auto: Gemma and some OpenAI-compat routes reject role=system; merge into user (env: LLM_MERGE_SYSTEM_INTO_USER)
     llm_merge_system_into_user: bool | None = Field(default=None)
@@ -62,9 +61,8 @@ class Settings(BaseSettings):
             self.openai_base_url = NVIDIA_DEFAULT_BASE_URL
         if not nv and not oa:
             raise ValueError("Set OPENAI_API_KEY or NVIDIA_API_KEY in .env")
-        uses_nvidia = bool(nv) or _looks_like_nvidia_host(self.openai_base_url)
         if self.nvidia_enable_thinking is None:
-            self.nvidia_enable_thinking = uses_nvidia
+            self.nvidia_enable_thinking = False
         fsm = (self.hiivbuddy_force_session_mode or "").strip().lower()
         if fsm not in ("", "off", "classic", "swarm"):
             self.hiivbuddy_force_session_mode = None
@@ -79,6 +77,16 @@ class Settings(BaseSettings):
         if not key:
             raise ValueError("Set OPENAI_API_KEY or NVIDIA_API_KEY in .env")
         return key
+
+    def resolved_debate_model(self, request_model: str) -> str:
+        """Model id for debate turns (streaming + interjections + swarm steps)."""
+        d = (self.llm_debate_model or "").strip()
+        return d if d else request_model
+
+    def resolved_synth_model(self, request_model: str) -> str:
+        """Model id for post-debate phases (votes, closing JSON, final report)."""
+        d = (self.llm_synth_model or "").strip()
+        return d if d else request_model
 
     def completion_extra_body(self) -> dict[str, Any] | None:
         if not self.nvidia_enable_thinking:

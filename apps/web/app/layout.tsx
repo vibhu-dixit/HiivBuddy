@@ -3,9 +3,15 @@ import "./globals.css";
 
 import { AuthProvider } from "./auth/AuthProvider";
 
+import { LANDING_COPY } from "./components/landing/landingCopy";
+
 export const metadata: Metadata = {
-  title: "HiivBuddy — Decision Room",
-  description: "Swarm-style AI debate for decisions",
+  title: LANDING_COPY.meta.title,
+  description: LANDING_COPY.meta.description,
+  icons: {
+    icon: "/logo.png",
+    apple: "/logo.png",
+  },
 };
 
 export default function RootLayout({

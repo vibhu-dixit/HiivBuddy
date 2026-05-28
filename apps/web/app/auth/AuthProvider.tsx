@@ -17,7 +17,12 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 export type AuthUser = {
   userId: number;
   username: string;
+  isGuest?: boolean;
 };
+
+export function isGuestUsername(username: string): boolean {
+  return username.startsWith("guest_");
+}
 
 type AuthContextValue = {
   token: string | null;
@@ -25,6 +30,7 @@ type AuthContextValue = {
   loading: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
+  loginAsGuest: (captchaToken?: string) => Promise<void>;
   logout: () => void;
 };
 
@@ -56,7 +62,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const parsed = JSON.parse(raw) as { token: string; user: AuthUser };
       if (parsed?.token && parsed?.user?.userId != null && parsed?.user?.username) {
         setToken(parsed.token);
-        setUser(parsed.user);
+        setUser({
+          ...parsed.user,
+          isGuest: parsed.user.isGuest ?? isGuestUsername(parsed.user.username),
+        });
       }
     } catch {
       sessionStorage.removeItem(AUTH_STORAGE_KEY);
@@ -91,6 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       persist(data.access_token, {
         userId: data.user.id,
         username: data.user.username,
+        isGuest: false,
       });
     },
     [persist],
@@ -113,10 +123,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       persist(data.access_token, {
         userId: data.user.id,
         username: data.user.username,
+        isGuest: false,
       });
     },
     [persist],
   );
+
+  const loginAsGuest = useCallback(async (captchaToken?: string) => {
+    const res = await fetch(`${API_URL}/auth/guest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        captchaToken ? { captcha_token: captchaToken } : {},
+      ),
+    });
+    if (!res.ok) {
+      throw new Error(await readErrorMessage(res));
+    }
+    const data = (await res.json()) as {
+      access_token: string;
+      user: { id: number; username: string };
+    };
+    persist(data.access_token, {
+      userId: data.user.id,
+      username: data.user.username,
+      isGuest: true,
+    });
+  }, [persist]);
 
   const logout = useCallback(() => {
     setToken(null);
@@ -131,9 +164,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       login,
       register,
+      loginAsGuest,
       logout,
     }),
-    [token, user, loading, login, register, logout],
+    [token, user, loading, login, register, loginAsGuest, logout],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

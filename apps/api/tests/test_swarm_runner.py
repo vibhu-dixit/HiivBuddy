@@ -66,18 +66,23 @@ class _FakeLLM:
     def common_completion_kwargs(self) -> dict:
         return {"temperature": 0.5, "max_tokens": 1024}
 
+    def resolved_debate_model(self, request_model: str) -> str:
+        return request_model
+
+    def resolved_synth_model(self, request_model: str) -> str:
+        return request_model
+
 
 def test_swarm_runner_one_utter_then_post_debate(monkeypatch):
-    _mono_seq = [0.0, 0.0, 0.5, 1000.0]
     _mi = 0
 
     def fake_monotonic() -> float:
         nonlocal _mi
-        if _mi < len(_mono_seq):
-            v = _mono_seq[_mi]
-            _mi += 1
-            return v
-        return 1_000_000.0
+        _mi += 1
+        # Inner repick loop calls monotonic more often; stay in budget until post-debate.
+        if _mi > 40:
+            return 1_000_000.0
+        return 0.1
 
     monkeypatch.setattr("app.debate.swarm_runner.time.monotonic", fake_monotonic)
 

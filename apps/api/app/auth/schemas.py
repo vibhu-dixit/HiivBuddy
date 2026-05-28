@@ -20,3 +20,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
+
+
+class GuestRequest(BaseModel):
+    captcha_token: str | None = Field(default=None, max_length=4096)

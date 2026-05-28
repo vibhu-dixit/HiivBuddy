@@ -1,10 +1,11 @@
 import json
+import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import asyncpg
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -12,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_user
-from app.auth.router import router as auth_router
+from app.auth.router import is_guest_user, router as auth_router
 from app.db import models  # noqa: F401 — register models before routes
 from app.db.models import DebateRun, User
 from app.db.prune import prune_all_users_excess_runs, prune_excess_runs_for_user
@@ -23,27 +24,7 @@ from app.context_ingest import extract_text_from_upload
 from app.debate.schemas import DebateRequest
 from app.llm.client import get_async_client, get_settings
 
-_DEBUG_DEBATE_LOG = Path(__file__).resolve().parents[3] / "debug-148c8e.log"
-
-
-def _dbg_debate(hypothesis_id: str, message: str, data: dict[str, Any]) -> None:
-    try:
-        with open(_DEBUG_DEBATE_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "sessionId": "148c8e",
-                        "location": "main.py",
-                        "message": message,
-                        "data": {"hypothesisId": hypothesis_id, **data},
-                        "timestamp": int(time.time() * 1000),
-                        "runId": "debate",
-                    },
-                )
-                + "\n",
-            )
-    except OSError:
-        pass
+logger = logging.getLogger(__name__)
 
 
 def _cors_allow_origins() -> list[str]:
@@ -62,9 +43,26 @@ def _cors_allow_origins() -> list[str]:
     return merged
 
 
+def _exception_root(exc: BaseException) -> BaseException:
+    e: BaseException = exc
+    while e.__cause__ is not None:
+        e = e.__cause__
+    return e
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        root = _exception_root(e)
+        if isinstance(root, asyncpg.InvalidPasswordError):
+            logger.error(
+                "PostgreSQL rejected DATABASE_URL credentials. Update apps/api/.env so user/password "
+                "match your server. If you use Docker's db service: "
+                "`docker compose up db` then DATABASE_URL=postgresql://hiivbuddy:hiivbuddy@localhost:5435/hiivbuddy",
+            )
+        raise
     async with async_session_maker() as session:
         await prune_all_users_excess_runs(session)
     yield
@@ -72,7 +70,7 @@ async def lifespan(_: FastAPI):
 
 AGENT_NAMES = {a["id"]: a["name"] for a in AGENTS}
 
-app = FastAPI(title="HiivBuddy API", lifespan=lifespan)
+app = FastAPI(title="Hiiv API", lifespan=lifespan)
 
 app.include_router(auth_router)
 
@@ -117,8 +115,10 @@ def _format_sse(payload: dict[str, Any]) -> str:
 async def debate_event_stream(
     body: DebateRequest,
     session: AsyncSession,
-    user_id: int,
+    current_user: User,
 ) -> AsyncIterator[str]:
+    user_id = current_user.id
+    guest_session = is_guest_user(current_user)
     client = get_async_client()
     transcript_parts: list[str] = []
     final_report: dict[str, Any] | None = None
@@ -128,6 +128,15 @@ async def debate_event_stream(
     session_mode = body.session_mode
     if settings.hiivbuddy_force_session_mode in ("classic", "swarm"):
         session_mode = settings.hiivbuddy_force_session_mode  # type: ignore[assignment]
+
+    logger.info(
+        "debate_sse_start user_id=%s guest=%s session_mode=%s duration_sec=%s model=%s",
+        user_id,
+        guest_session,
+        session_mode,
+        body.session_duration_sec,
+        (body.model or "")[:120],
+    )
 
     stream = (
         run_swarm_session_stream(
@@ -157,95 +166,100 @@ async def debate_event_stream(
         )
     )
 
-    _dbg_debate(
-        "E",
-        "debate_generator_ready",
-        {
-            "model": body.model[:120],
-            "ctxLen": len(body.context),
-            "sessionMode": str(session_mode),
-        },
-    )
+    try:
+        async for event in stream:
+            et = event.get("type")
+            if et == "session_start":
+                transcript_parts.append(
+                    "--- Session ---\n"
+                    + json.dumps(
+                        {
+                            "session_duration_sec": event.get("session_duration_sec"),
+                            "debate_budget_sec": event.get("debate_budget_sec"),
+                            "synth_reserve_sec": event.get("synth_reserve_sec"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            elif et == "debate_phase_end":
+                transcript_parts.append(
+                    f"--- Debate phase end (turns: {event.get('turns_completed', 0)}) ---",
+                )
+            elif et == "agent_decision_trace":
+                transcript_parts.append(
+                    "--- Agent stance trace ---\n"
+                    + json.dumps(event.get("stances") or [], ensure_ascii=False),
+                )
+            elif et == "vote_phase_start":
+                transcript_parts.append("--- Vote phase ---")
+            elif et == "agent_end" and event.get("full_text"):
+                aid = event.get("agent") or ""
+                name = AGENT_NAMES.get(str(aid), str(aid))
+                turn = event.get("turn")
+                prefix = f"[Turn {turn}][{name}]" if turn is not None else f"[{name}]"
+                transcript_parts.append(f"{prefix}: {event['full_text']}")
+            elif et == "interjection" and event.get("text"):
+                oa = event.get("agent") or ""
+                on = AGENT_NAMES.get(str(oa), str(oa))
+                ta = event.get("target_agent") or ""
+                tn = AGENT_NAMES.get(str(ta), str(ta))
+                turn = event.get("turn")
+                prefix = (
+                    f"[Turn {turn}][{on} interjects → {tn}]"
+                    if turn is not None
+                    else f"[{on} interjects → {tn}]"
+                )
+                transcript_parts.append(f"{prefix}: {event['text']}")
+            elif et == "vote_tally":
+                transcript_parts.append(
+                    "--- Vote tally ---\n"
+                    + json.dumps(
+                        {
+                            "tallies": event.get("tallies"),
+                            "votes": event.get("votes"),
+                            "consensus_reached": event.get("consensus_reached"),
+                            "winning_option_id": event.get("winning_option_id"),
+                            "winning_title": event.get("winning_title"),
+                            "threshold": event.get("threshold"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            elif et == "env_snapshot":
+                transcript_parts.append(
+                    f"--- Environment snapshot ({event.get('phase')}) ---\n"
+                    + json.dumps(event.get("snapshot") or {}, ensure_ascii=False),
+                )
+            if et == "final_report":
+                fr = event.get("report")
+                es = event.get("env_snapshot")
+                if isinstance(fr, dict) and es is not None:
+                    final_report = {**fr, "env_snapshot": es}
+                else:
+                    final_report = fr
+            yield _format_sse(event)
+    except Exception:
+        logger.exception("debate_sse_failed user_id=%s", user_id)
+        yield _format_sse(
+            {
+                "type": "stream_error",
+                "message": (
+                    "The session ended unexpectedly during voting or synthesis. "
+                    "Your debate turns above are still valid."
+                ),
+            },
+        )
+        if not transcript_parts:
+            yield _format_sse({"type": "done"})
+            return
 
-    first_stream_event = True
-    async for event in stream:
-        if first_stream_event:
-            first_stream_event = False
-            _dbg_debate(
-                "E",
-                "debate_first_orchestrator_event",
-                {"eventType": str(event.get("type"))},
-            )
-        et = event.get("type")
-        if et == "session_start":
-            transcript_parts.append(
-                "--- Session ---\n"
-                + json.dumps(
-                    {
-                        "session_duration_sec": event.get("session_duration_sec"),
-                        "debate_budget_sec": event.get("debate_budget_sec"),
-                        "synth_reserve_sec": event.get("synth_reserve_sec"),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        elif et == "debate_phase_end":
-            transcript_parts.append(
-                f"--- Debate phase end (turns: {event.get('turns_completed', 0)}) ---",
-            )
-        elif et == "agent_decision_trace":
-            transcript_parts.append(
-                "--- Agent stance trace ---\n"
-                + json.dumps(event.get("stances") or [], ensure_ascii=False),
-            )
-        elif et == "vote_phase_start":
-            transcript_parts.append("--- Vote phase ---")
-        elif et == "agent_end" and event.get("full_text"):
-            aid = event.get("agent") or ""
-            name = AGENT_NAMES.get(str(aid), str(aid))
-            turn = event.get("turn")
-            prefix = f"[Turn {turn}][{name}]" if turn is not None else f"[{name}]"
-            transcript_parts.append(f"{prefix}: {event['full_text']}")
-        elif et == "interjection" and event.get("text"):
-            oa = event.get("agent") or ""
-            on = AGENT_NAMES.get(str(oa), str(oa))
-            ta = event.get("target_agent") or ""
-            tn = AGENT_NAMES.get(str(ta), str(ta))
-            turn = event.get("turn")
-            prefix = (
-                f"[Turn {turn}][{on} interjects → {tn}]"
-                if turn is not None
-                else f"[{on} interjects → {tn}]"
-            )
-            transcript_parts.append(f"{prefix}: {event['text']}")
-        elif et == "vote_tally":
-            transcript_parts.append(
-                "--- Vote tally ---\n"
-                + json.dumps(
-                    {
-                        "tallies": event.get("tallies"),
-                        "votes": event.get("votes"),
-                        "consensus_reached": event.get("consensus_reached"),
-                        "winning_option_id": event.get("winning_option_id"),
-                        "winning_title": event.get("winning_title"),
-                        "threshold": event.get("threshold"),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        elif et == "env_snapshot":
-            transcript_parts.append(
-                f"--- Environment snapshot ({event.get('phase')}) ---\n"
-                + json.dumps(event.get("snapshot") or {}, ensure_ascii=False),
-            )
-        if et == "final_report":
-            fr = event.get("report")
-            es = event.get("env_snapshot")
-            if isinstance(fr, dict) and es is not None:
-                final_report = {**fr, "env_snapshot": es}
-            else:
-                final_report = fr
-        yield _format_sse(event)
+    if not transcript_parts:
+        yield _format_sse({"type": "done"})
+        return
+
+    if guest_session:
+        yield _format_sse({"type": "done"})
+        return
 
     row = DebateRun(
         user_id=user_id,
@@ -271,7 +285,7 @@ async def debate_stream(
     current_user: User = Depends(get_current_user),
 ):
     return StreamingResponse(
-        debate_event_stream(body, session, current_user.id),
+        debate_event_stream(body, session, current_user),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

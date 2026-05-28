@@ -1,5 +1,6 @@
 import type { StoredVoteTally } from "./debateHistory";
 import type { Turn } from "./debateTypes";
+import { isTurnVisibleToUser, sanitizeDebateTurnText } from "./displayDebateText";
 
 const esc = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 
@@ -33,7 +34,7 @@ export type SessionExportInput = {
 
 export function buildSessionMarkdown(s: SessionExportInput): string {
   const lines: string[] = [];
-  lines.push("# HiivBuddy — Decision session export");
+  lines.push("# Hiiv — Decision session export");
   lines.push("");
   if (s.savedAt) {
     lines.push(`- **Saved:** ${s.savedAt}`);
@@ -41,14 +42,14 @@ export function buildSessionMarkdown(s: SessionExportInput): string {
   if (s.runId != null) {
     lines.push(`- **Run ID:** ${s.runId}`);
   }
-  lines.push(`- **Model:** ${esc(s.model)}`);
+  lines.push(
+    `- **Model:** ${esc(s.model.trim() || "Server default (API LLM_DEFAULT_MODEL / tier env)")}`,
+  );
   lines.push(`- **Session (sec):** ${s.session_duration_sec}`);
   lines.push(`- **Consensus threshold:** ${s.consensus_threshold}`);
   lines.push(`- **Parallel interjections:** ${s.enable_interjections ? "yes" : "no"}`);
   const mode = s.session_mode ?? s.debate_mode;
-  if (mode && mode !== "classic") {
-    lines.push(`- **Session mode:** ${mode}`);
-  }
+  lines.push(`- **Session mode:** ${mode ?? "(unspecified)"}`);
   if (s.track_environment) {
     lines.push(`- **Track environment:** yes`);
   }
@@ -85,6 +86,12 @@ export function buildSessionMarkdown(s: SessionExportInput): string {
   } else {
     let lastTurn = -1;
     for (const t of s.turns) {
+      if (t.kind !== "interjection" && !isTurnVisibleToUser(t.text ?? "")) continue;
+      const body =
+        t.kind === "interjection"
+          ? t.text.trim()
+          : sanitizeDebateTurnText(t.text ?? "").text.trim();
+      if (!body) continue;
       if (t.turn !== lastTurn) {
         if (lastTurn >= 0) lines.push("");
         lines.push(`### Turn ${t.turn}`);
@@ -95,18 +102,8 @@ export function buildSessionMarkdown(s: SessionExportInput): string {
           ? `${t.name} (interjects → ${t.targetName})`
           : t.name;
       lines.push(`**${who}**`);
-      if (t.reasoning?.trim()) {
-        lines.push("");
-        lines.push("<details><summary>Model reasoning</summary>");
-        lines.push("");
-        lines.push("```");
-        lines.push(t.reasoning.trim());
-        lines.push("```");
-        lines.push("");
-        lines.push("</details>");
-      }
       lines.push("");
-      lines.push(t.text.trim() || "_(empty)_");
+      lines.push(body);
       lines.push("");
     }
   }
