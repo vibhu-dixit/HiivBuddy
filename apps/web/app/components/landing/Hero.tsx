@@ -9,7 +9,7 @@ type HeroProps = {
 };
 
 export function Hero({ onTryDemo, demoBusy }: HeroProps) {
-  const { hero, contact } = LANDING_COPY;
+  const { hero } = LANDING_COPY;
 
   return (
     <section className="landing-hero relative overflow-hidden bg-[var(--landing-hero-bg)] text-[var(--landing-hero-fg)]">
@@ -41,14 +41,6 @@ export function Hero({ onTryDemo, demoBusy }: HeroProps) {
             >
               {demoBusy ? "Starting…" : hero.ctaPrimary}
             </button>
-            <a
-              href={contact.href}
-              target="_blank"
-              rel="noreferrer"
-              className="min-h-[44px] rounded-lg border border-white/20 bg-white/5 px-6 py-3 text-sm font-semibold text-white backdrop-blur-sm hover:bg-white/10"
-            >
-              {contact.label}
-            </a>
           </div>
           <p className="mt-4 text-sm text-[var(--landing-hero-muted)]">{hero.ctaNote}</p>
         </SplitSection>

@@ -87,18 +87,8 @@ export default function LandingPage() {
         onConfirm={handleDemoConfirm}
       />
       <footer className="border-t border-[var(--border)] bg-[var(--card)] py-8">
-        <div className="mx-auto flex max-w-6xl flex-col items-start justify-between gap-4 px-6 text-sm text-[var(--muted)] sm:flex-row sm:items-center">
+        <div className="mx-auto max-w-6xl px-6 text-sm text-[var(--muted)]">
           <span>© {new Date().getFullYear()} Hiiv</span>
-          <div className="flex gap-4">
-            <a
-              href={LANDING_COPY.contact.href}
-              target="_blank"
-              rel="noreferrer"
-              className="hover:text-[var(--foreground)]"
-            >
-              {LANDING_COPY.contact.label}
-            </a>
-          </div>
         </div>
       </footer>
     </div>

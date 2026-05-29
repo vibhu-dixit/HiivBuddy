@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { useAuth } from "../../auth/AuthProvider";
-import { LANDING_COPY } from "./landingCopy";
 
 type SiteHeaderProps = {
   onTryDemo?: () => void;
@@ -28,7 +27,6 @@ function smoothstep(t: number) {
 
 export function SiteHeader({ onTryDemo, demoBusy }: SiteHeaderProps) {
   const { user, loading } = useAuth();
-  const { contact } = LANDING_COPY;
   const [progress, setProgress] = useState(0);
   const [trackWidth, setTrackWidth] = useState(0);
   const [logoWidth, setLogoWidth] = useState(0);
@@ -161,26 +159,16 @@ export function SiteHeader({ onTryDemo, demoBusy }: SiteHeaderProps) {
                 Open Decision Room
               </Link>
             ) : (
-              <>
-                <a
-                  href={contact.href}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-sm font-medium text-white hover:text-white/80"
+              onTryDemo && (
+                <button
+                  type="button"
+                  onClick={onTryDemo}
+                  disabled={demoBusy}
+                  className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-sm font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50 sm:px-4 sm:py-2"
                 >
-                  {contact.label}
-                </a>
-                {onTryDemo && (
-                  <button
-                    type="button"
-                    onClick={onTryDemo}
-                    disabled={demoBusy}
-                    className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-sm font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50 sm:px-4 sm:py-2"
-                  >
-                    {demoBusy ? "Starting…" : "Try demo"}
-                  </button>
-                )}
-              </>
+                  {demoBusy ? "Starting…" : "Try demo"}
+                </button>
+              )
             )}
           </nav>
         </div>

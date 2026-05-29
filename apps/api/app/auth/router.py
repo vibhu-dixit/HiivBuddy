@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.jwt_tokens import create_access_token
 from app.auth.password import hash_password, verify_password
 from app.auth.captcha import enforce_guest_captcha
+from app.auth.rate_limit import client_ip, enforce_guest_auth_rate_limit
 from app.auth.schemas import GuestRequest, LoginRequest, RegisterRequest, TokenResponse, UserPublic
 from app.db.models import User
 from app.db.session import get_session
@@ -92,8 +93,9 @@ async def guest_session(
     if not _guest_auth_enabled():
         raise HTTPException(status_code=403, detail="Guest access is disabled")
 
-    client_ip = request.client.host if request.client else None
-    await enforce_guest_captcha(body.captcha_token, client_ip)
+    enforce_guest_auth_rate_limit(request)
+
+    await enforce_guest_captcha(body.captcha_token, client_ip(request))
 
     guest_id = uuid.uuid4().hex[:12]
     username = f"guest_{guest_id}"

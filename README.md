@@ -8,12 +8,41 @@ It’s inspired by “swarm” style thinking: not one chatbot answer, but sever
 
 ## What you get
 
-- **Marketing home (`/`)** — Public landing page with **Try demo** (guest session, no sign-up) and **Sign in** (`/login`).
-- **Decision Room** (`/decision-room`) — Paste your context, **attach** `.txt` / `.md` / `.pdf` (PDF text is extracted via the API), pick a model, and run the flow. **Export Markdown** downloads the current or saved session (context, transcript, votes, report).
-- **Timed debate** — You set **session length** (60–600 seconds). The API runs debate until the **debate budget** (`session_duration_sec − 30`) elapses, then runs vote + synthesis. Primary turns are capped at **three sentences**; optional **parallel interjections** after each speaker.
-- **Vote** — The system proposes a few clear options from the debate; each advisor picks one. You’ll see counts and whether a **consensus** threshold was met (default: 3 out of 5).
+- **Marketing home (`/`)** — Public landing with **Try demo** only (guest session, no sign-up). **Sign in / Sign up links are intentionally hidden** on the landing page for now; accounts still work via the direct URL (see [Accounts & login](#accounts--login-hidden-on-landing) below).
+- **Decision Room** (`/decision-room`) — Paste your context, **attach** `.txt` / `.md` / `.pdf` (PDF text is extracted via the API), and run the flow. **Export Markdown** downloads the current or saved session (context, transcript, votes, report).
+- **Default session mode: swarm** — Structured JSON turns with a forced vote and decision brief (set `NEXT_PUBLIC_DEFAULT_SESSION_MODE=classic` for streamed debate + interjections).
+- **Timed debate** — Session length is fixed in the UI for MVP (about two to three minutes). The API runs debate until the **debate budget** (`session_duration_sec − 30`) elapses, then runs vote + synthesis. In **classic** mode, primary turns are capped at **three sentences** with optional **parallel interjections** after each speaker.
+- **Vote** — The system proposes clear options from the debate; each advisor picks one. You’ll see counts and whether a **consensus** threshold was met (default: 3 out of 5).
 - **Final report** — A structured summary: overview, ranked options, risks, suggested next steps.
-- **Saved runs** — Each completed run is stored in the API’s **PostgreSQL** database so you can build on this later (e.g. history screens).
+- **Saved runs (registered users only)** — Completed runs are stored in **PostgreSQL** and mirrored in the browser’s local history panel. **Guest demo sessions are ephemeral** (no server save, no history panel).
+
+---
+
+## Accounts & login (hidden on landing)
+
+The product currently optimizes for **Try demo** on the public site. Register / sign-in **buttons are not shown** on the landing header, hero, or footer.
+
+**Login and sign-up still work.** Use either:
+
+| How | URL |
+|-----|-----|
+| Direct link | **`http://localhost:3000/login`** (or `https://your-domain/login` in production) |
+| From guest demo | In Decision Room, the demo banner includes a **Sign up** link to `/login` |
+
+On `/login` you can **Log in** or **Sign up** (username + password). After auth you get:
+
+- Saved debate history (local + server)
+- History panel in Decision Room
+- Runs persisted in PostgreSQL (up to 60 per user, pruned automatically)
+
+**Guest demo** (`Try demo` on `/`):
+
+- Requires Cloudflare Turnstile in production (or `GUEST_CAPTCHA_BYPASS=true` locally)
+- Per-IP rate limits on the API (see [`.env.example`](.env.example))
+- Guest JWT expires after **4 hours** by default
+- No saved runs on the server; refreshing clears local guest state
+
+To **re-enable sign-in on the landing page** later, add links back to `/login` in `apps/web/app/components/landing/SiteHeader.tsx`, `Hero.tsx`, and `apps/web/app/page.tsx` (footer).
 
 ---
 
@@ -61,13 +90,23 @@ Other useful variables are documented in [`.env.example`](.env.example) (tempera
 
 ```env
 NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
-# Optional: default model shown in Decision Room (should match your provider)
-# NEXT_PUBLIC_DEFAULT_MODEL=stepfun-ai/step-3.5-flash
+# Required for Try demo in production (must match TURNSTILE_SECRET_KEY on the API):
+# NEXT_PUBLIC_TURNSTILE_SITE_KEY=your_site_key
+# Optional: classic streamed debate instead of default swarm
+# NEXT_PUBLIC_DEFAULT_SESSION_MODE=classic
 ```
 
 If the API runs elsewhere, change this URL to match.
 
-**Guest demo:** `POST /auth/guest` issues a short-lived token for anonymous trials. **Try demo** requires Cloudflare Turnstile: set **`TURNSTILE_SECRET_KEY`** on the API and **`NEXT_PUBLIC_TURNSTILE_SITE_KEY`** on the web app (see [`.env.example`](.env.example) for test keys). For local dev without captcha, set **`GUEST_CAPTCHA_BYPASS=true`** in **`apps/api/.env`**. Also: **`GUEST_AUTH_ENABLED`**, **`GUEST_TOKEN_EXPIRE_MINUTES`** (default 240).
+**Guest demo:** `POST /auth/guest` issues a short-lived token for anonymous trials. **Try demo** requires Cloudflare Turnstile in production: set **`TURNSTILE_SECRET_KEY`** on the API and **`NEXT_PUBLIC_TURNSTILE_SITE_KEY`** on the web app (see [`.env.example`](.env.example) for test keys). For local dev without captcha, set **`GUEST_CAPTCHA_BYPASS=true`** in **`apps/api/.env`**.
+
+Also useful on the API:
+
+- **`GUEST_AUTH_ENABLED`** — `false` disables guest demo entirely (default: enabled).
+- **`GUEST_TOKEN_EXPIRE_MINUTES`** — guest JWT lifetime (default **240**).
+- **`GUEST_AUTH_IP_RATE_LIMIT`** / **`GUEST_AUTH_IP_RATE_WINDOW_SEC`** — cap guest account creation per IP (defaults: **5 / hour**).
+- **`GUEST_DEBATE_IP_RATE_LIMIT`** / **`GUEST_DEBATE_IP_RATE_WINDOW_SEC`** — cap guest debate runs per IP (defaults: **3 / hour**). Limits are in-memory per API process.
+- **`JWT_SECRET`** — **required in production** for username/password auth (never use the dev default on Render).
 
 **Docker:** optionally copy **`.env.example`** → **`.env`** in the **project root** and add **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**. Compose substitutes `${VAR}` values from that file into the API container when the file exists—it is **not** required for `docker compose up` to start (the stack still needs real keys in `.env` or your shell for the API to answer debates).
 
@@ -97,7 +136,7 @@ npm install
 npm run dev
 ```
 
-Open **`http://localhost:3000`**, go to **Decision Room**, paste enough context (the app asks for a minimum length), set **session length** (60–600 seconds), then **Run debate**.
+Open **`http://localhost:3000`**. For a quick trial, click **Try demo** on the home page. For a registered account with saved history, go directly to **`http://localhost:3000/login`**, then open **Decision Room**. Paste enough context (minimum length enforced in the UI), then **Run debate**.
 
 **`POST /debate/stream` body (JSON):** `context`, `model`, `session_duration_sec` (60–600), `consensus_threshold` (1–5), `enable_interjections`. The server uses a **monotonic clock**: primary debate runs until **`session_duration_sec − 30`** seconds have passed (checked before each new speaker). The **last 30 seconds** of the chosen duration are reserved on that clock for vote extraction, stance signals, and the **Chief Synthesizer**. The synthesizer HTTP call uses a **separate, longer** server timeout (90s in `SYNTH_API_TIMEOUT_SEC`) so slow endpoints can still return a full JSON report.
 
@@ -147,7 +186,9 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 ### Vercel (frontend)
 
 1. Create a project from this repo and set **Root Directory** to **`apps/web`** (Framework Preset: Next.js).
-2. In **Project → Settings → Environment Variables**, set **`NEXT_PUBLIC_API_URL`** to your public API base URL (HTTPS, **no trailing slash**), e.g. `https://hiiv-api.onrender.com`.
+2. In **Project → Settings → Environment Variables**, set:
+   - **`NEXT_PUBLIC_API_URL`** — your public API base URL (HTTPS, **no trailing slash**), e.g. `https://hiiv-api.onrender.com`
+   - **`NEXT_PUBLIC_TURNSTILE_SITE_KEY`** — required for **Try demo** (pairs with `TURNSTILE_SECRET_KEY` on the API)
 3. Deploy. Preview deployments get their own `*.vercel.app` URLs; add each origin you use to **`CORS_ORIGINS`** on the API (see below), or use your production Vercel domain only.
 
 ### API on Render, Railway, Fly.io, etc.
@@ -156,7 +197,7 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 2. **Build:** `pip install -r requirements.txt`  
    **Start:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`  
    (Or rely on the included **[`apps/api/Procfile`](apps/api/Procfile)** if your host supports it.)
-3. Set the same secrets as local development: **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**, **`LLM_DEFAULT_MODEL`**, and any other variables from [`.env.example`](.env.example).
+3. Set the same secrets as local development: **`OPENAI_API_KEY`** and/or **`NVIDIA_API_KEY`**, **`LLM_DEFAULT_MODEL`**, **`JWT_SECRET`**, **`TURNSTILE_SECRET_KEY`**, and any other variables from [`.env.example`](.env.example).
 4. Set **`CORS_ORIGINS`** to a comma-separated list of allowed browser origins, e.g. `https://your-app.vercel.app,https://www.yourdomain.com`. Local **`http://localhost:3000`** is included by default on the API so you can still develop against a remote API if needed.
 5. **PostgreSQL:** Create a **PostgreSQL** instance on your host (Render: **New → PostgreSQL**) and link it to the Web Service so **`DATABASE_URL`** is set automatically. For local development, run Postgres (e.g. **`docker compose up db`** from the repo root) and set **`DATABASE_URL`** in **`apps/api/.env`** as in [`.env.example`](.env.example).
 
@@ -168,15 +209,12 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 - **“Error in input stream” / 500 during a run** — Usually the AI returned something the parser didn’t expect. Retry once; if it persists, try a different model or turn off “thinking” extras for that model in `.env` (see `.env.example`).
 - **Website can’t reach the API** — Check `NEXT_PUBLIC_API_URL` matches where the API actually runs (`127.0.0.1` vs `localhost` should be consistent with your browser).
 - **`OPENAI_API_KEY` / `NVIDIA_API_KEY` errors on startup** — The API didn’t find a key. Confirm **`apps/api/.env`** exists and is loaded (you started `uvicorn` from **`apps/api`**).
+- **Try demo fails / “Complete the captcha”** — Set Turnstile keys on web + API, or use **`GUEST_CAPTCHA_BYPASS=true`** locally only.
+- **429 Too many requests** — Guest IP rate limit hit; wait for the window to reset or adjust limits in `.env`.
+- **Decision Room redirects to `/login`** — You need a guest or registered session. Use **Try demo** from `/` or open **`/login`** directly.
 
 ---
 
 ## Product note
 
-The original product vision (broader roadmap: teams, long-term memory, billing, exports) lives in **`Hivvbuddy_PDD.pdf`** in this repo. This codebase focuses on the **core loop**: timed debate → vote → report, with persistence in PostgreSQL.
-
----
-
-## License
-
-Add a license file if you plan to distribute the project; none is set by default in this README.
+The original product vision (broader roadmap: teams, long-term memory, billing, exports) lives in **`Hivvbuddy.pdf`** in this repo. This codebase focuses on the **core loop**: timed debate → vote → report, with persistence in PostgreSQL.

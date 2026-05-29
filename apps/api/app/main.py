@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import asyncpg
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_user
+from app.auth.rate_limit import enforce_guest_debate_rate_limit
 from app.auth.router import is_guest_user, router as auth_router
 from app.db import models  # noqa: F401 — register models before routes
 from app.db.models import DebateRun, User
@@ -280,10 +281,14 @@ async def debate_event_stream(
 
 @app.post("/debate/stream")
 async def debate_stream(
+    request: Request,
     body: DebateRequest,
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    if is_guest_user(current_user):
+        enforce_guest_debate_rate_limit(request)
+
     return StreamingResponse(
         debate_event_stream(body, session, current_user),
         media_type="text/event-stream",

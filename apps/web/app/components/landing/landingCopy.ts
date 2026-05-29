@@ -1,10 +1,6 @@
 /** Centralized landing page copy — GTM voice, SEO-friendly, no product jargon. */
 
 export const LANDING_COPY = {
-  contact: {
-    href: "mailto:vibhu.dixit02@gmail.com?subject=Hiiv%20pricing&body=Hi%20—%20I%E2%80%99d%20like%20to%20learn%20about%20pricing%20for%20Hiiv.%0A%0AName:%0ACompany:%0AUse%20case:%0A",
-    label: "Contact for pricing",
-  },
   meta: {
     title: "Hiiv — Decision support for founders",
     description:
@@ -20,8 +16,7 @@ export const LANDING_COPY = {
     deliverable:
       "About three minutes per session. Export a summary when you are ready to share it with your team or board.",
     ctaPrimary: "Try demo",
-    ctaSecondary: "Contact for pricing",
-    ctaNote: "Free guest demo. No credit card. Contact us when you’re ready to unlock accounts and history.",
+    ctaNote: "Free guest demo. No credit card required.",
   },
 
   tagline: {
@@ -69,7 +64,7 @@ export const LANDING_COPY = {
   cta: {
     title: "Ready to pressure-test your next decision?",
     description:
-      "Start with a guest demo—no account required. Contact us for pricing when you’re ready to unlock saved history.",
+      "Start with a guest demo—no account required. Run a session and export your decision brief.",
     button: "Try demo",
   },
 
