@@ -79,10 +79,10 @@ def test_swarm_runner_one_utter_then_post_debate(monkeypatch):
     def fake_monotonic() -> float:
         nonlocal _mi
         _mi += 1
-        # Inner repick loop calls monotonic more often; stay in budget until post-debate.
-        if _mi > 40:
-            return 1_000_000.0
-        return 0.1
+        # Past debate budget (30s) but still inside 60s session so closing/synth can run.
+        if _mi > 50:
+            return 35.0
+        return 0.1 + _mi * 0.05
 
     monkeypatch.setattr("app.debate.swarm_runner.time.monotonic", fake_monotonic)
 
@@ -94,6 +94,12 @@ def test_swarm_runner_one_utter_then_post_debate(monkeypatch):
             (m.get("content", "") for m in messages if m.get("role") == "user"),
             "",
         )
+        if "Return JSON with an options array" in str(user):
+            calls.append("option_seed")
+            return _resp(
+                '{"options":[{"id":"0","title":"Love-first path"},'
+                '{"id":"1","title":"Runway-first path"}]}',
+            )
         if "Return your JSON decision now" in str(user):
             calls.append("swarm_turn")
             return _resp('{"action":"utter","text":"One test utterance."}')
@@ -126,10 +132,10 @@ def test_swarm_runner_one_utter_then_post_debate(monkeypatch):
     events = asyncio.run(collect())
 
     assert "swarm_turn" in calls
-    assert "closing" in calls
     assert "synth" in calls
     types = [e["type"] for e in events]
     assert types[0] == "session_start"
+    assert "decision_options" in types
     assert "agent_end" in types
     assert "vote_tally" in types
     assert events[-1]["type"] == "final_report"

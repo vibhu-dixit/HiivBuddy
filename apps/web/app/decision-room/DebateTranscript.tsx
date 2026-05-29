@@ -31,6 +31,8 @@ type Props = {
   runId: number | null;
   debateScrollRef: RefObject<HTMLDivElement | null>;
   hideTechnical?: boolean;
+  /** Hide decision/vote options until the debate phase has finished (live sessions only). */
+  showOptionsAfterDebate?: boolean;
 };
 
 export function DebateTranscript({
@@ -46,6 +48,7 @@ export function DebateTranscript({
   runId,
   debateScrollRef,
   hideTechnical = false,
+  showOptionsAfterDebate = true,
 }: Props) {
   return (
     <div
@@ -115,9 +118,11 @@ export function DebateTranscript({
         </div>
       </section>
 
-      {voteOptions && voteOptions.length > 0 && (
+      {showOptionsAfterDebate && voteOptions && voteOptions.length > 0 && (
         <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
-          <h2 className="text-sm font-semibold text-[var(--foreground)]">Vote options</h2>
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">
+            {voteTally ? "Vote options" : "Decision options"}
+          </h2>
           <ul className="mt-2 flex flex-col gap-1 text-sm text-[var(--muted)]">
             {voteOptions.map((o) => (
               <li key={o.id}>

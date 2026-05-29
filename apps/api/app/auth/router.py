@@ -27,13 +27,17 @@ def is_guest_user(user: User) -> bool:
     return bool(_GUEST_USERNAME_RE.fullmatch(user.username))
 
 
-def _guest_auth_enabled() -> bool:
+def guest_auth_enabled() -> bool:
     return os.environ.get("GUEST_AUTH_ENABLED", "true").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def _guest_auth_enabled() -> bool:
+    return guest_auth_enabled()
 
 
 @router.post("/register", response_model=TokenResponse)
@@ -93,9 +97,9 @@ async def guest_session(
     if not _guest_auth_enabled():
         raise HTTPException(status_code=403, detail="Guest access is disabled")
 
-    enforce_guest_auth_rate_limit(request)
-
     await enforce_guest_captcha(body.captcha_token, client_ip(request))
+
+    enforce_guest_auth_rate_limit(request)
 
     guest_id = uuid.uuid4().hex[:12]
     username = f"guest_{guest_id}"

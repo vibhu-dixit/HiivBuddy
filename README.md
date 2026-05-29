@@ -140,7 +140,7 @@ Open **`http://localhost:3000`**. For a quick trial, click **Try demo** on the h
 
 **`POST /debate/stream` body (JSON):** `context`, `model`, `session_duration_sec` (60–600), `consensus_threshold` (1–5), `enable_interjections`. The server uses a **monotonic clock**: primary debate runs until **`session_duration_sec − 30`** seconds have passed (checked before each new speaker). The **last 30 seconds** of the chosen duration are reserved on that clock for vote extraction, stance signals, and the **Chief Synthesizer**. The synthesizer HTTP call uses a **separate, longer** server timeout (90s in `SYNTH_API_TIMEOUT_SEC`) so slow endpoints can still return a full JSON report.
 
-**`POST /context/extract` (multipart form-data, field `file`):** Extract plain text from **`.txt`**, **`.md` / `.markdown`**, or **`.pdf`** for use as debate context. Limits: **8 MB** raw file size, **65,536** characters of extracted text (truncated with `truncated: true` in JSON if longer). The Decision Room reads **`.txt` / `.md` in the browser** and sends **PDFs** to this endpoint. The combined context field is capped at **65,536 characters** in the UI to match.
+**`POST /context/extract` (multipart form-data, field `file`):** Extract plain text from **`.txt`**, **`.md` / `.markdown`**, or **`.pdf`** for use as debate context. Limits: **8 MB** raw file size, **500** characters of extracted text (truncated with `truncated: true` in JSON if longer). The Decision Room reads **`.txt` / `.md` in the browser** and sends **PDFs** to this endpoint. The combined context field is capped at **1,000 characters** in the UI to match.
 
 ---
 
@@ -210,7 +210,9 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 - **Website can’t reach the API** — Check `NEXT_PUBLIC_API_URL` matches where the API actually runs (`127.0.0.1` vs `localhost` should be consistent with your browser).
 - **`OPENAI_API_KEY` / `NVIDIA_API_KEY` errors on startup** — The API didn’t find a key. Confirm **`apps/api/.env`** exists and is loaded (you started `uvicorn` from **`apps/api`**).
 - **Try demo fails / “Complete the captcha”** — Set Turnstile keys on web + API, or use **`GUEST_CAPTCHA_BYPASS=true`** locally only.
-- **429 Too many requests** — Guest IP rate limit hit; wait for the window to reset or adjust limits in `.env`.
+- **“Guest demo is temporarily unavailable”** — The API is missing **`TURNSTILE_SECRET_KEY`** on Render (or your API host). Add the **secret** key from [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) to the API service env vars. The **site** key goes on Vercel as **`NEXT_PUBLIC_TURNSTILE_SITE_KEY`** — both keys must be from the same Turnstile widget, and the widget must list your Vercel domain under **Hostname management**. Check readiness: `GET https://your-api/health` → `guest_demo.ready` should be `true`.
+- **429 Too many requests** — Guest IP rate limit hit (default **5** guest sign-ins per IP per hour). If you saw this right after repeated “temporarily unavailable” errors, your IP was counted on each retry before captcha could succeed — redeploy the API to clear in-memory limits, wait up to an hour, or raise **`GUEST_AUTH_IP_RATE_LIMIT`** temporarily while testing. After deploying the Turnstile secret fix, new attempts only count once captcha passes.
+- **429 during a debate (guest)** — Separate limit: **`GUEST_DEBATE_IP_RATE_LIMIT`** (default **3/hour**).
 - **Decision Room redirects to `/login`** — You need a guest or registered session. Use **Try demo** from `/` or open **`/login`** directly.
 
 ---

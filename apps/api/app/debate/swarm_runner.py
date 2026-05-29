@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -17,10 +18,12 @@ from app.debate.orchestrator import (
     AGENTS,
     _completion_kw_for_messages,
     _debate_environment_seed,
+    _first_assistant_message,
     _synth_raw_from_assistant_message,
+    ensure_session_options,
     run_post_debate_phases,
 )
-from app.debate.schemas import SYNTH_RESERVE_SEC
+from app.debate.schemas import MIN_DEBATE_TURN_SEC, SYNTH_RESERVE_SEC
 from app.debate.swarm_scheduler import init_speech_counts, pick_next_agent_swarm
 from app.debate.swarm_schemas import (
     SWARM_JSON_RULES,
@@ -30,7 +33,6 @@ from app.debate.swarm_schemas import (
     transcript_line_for_turn,
     user_visible_turn_line,
 )
-from app.debate.context_options import seed_environment_options_from_context
 from app.debate.environment import AgentAction, PassAction
 from app.llm.client import Settings
 from app.llm.messages import prepare_chat_messages
@@ -55,7 +57,6 @@ async def run_swarm_session_stream(
     """
     total_sec = max(60, min(600, session_duration_sec))
     debate_budget_sec = max(0.0, float(total_sec - SYNTH_RESERVE_SEC))
-    t0 = time.monotonic()
     transcript = ""
     base_kw = llm.common_completion_kwargs()
     debate_model = llm.resolved_debate_model(model)
@@ -76,7 +77,20 @@ async def run_swarm_session_stream(
         limits=limits,
         mode="swarm",
     )
-    session_env = seed_environment_options_from_context(session_env, context)
+    session_env, session_options = await ensure_session_options(
+        client,
+        context=context,
+        model=model,
+        llm=llm,
+        env=session_env,
+    )
+    yield {
+        "type": "decision_options",
+        "options": [{"id": o.id, "title": o.title} for o in session_options],
+    }
+
+    t0 = time.monotonic()
+    session_deadline = t0 + float(total_sec)
     rng = random.Random(seed)
     speech_count = init_speech_counts(AGENTS)
     obs_config = ObservationConfig()
@@ -84,6 +98,12 @@ async def run_swarm_session_stream(
     max_speaker_attempts = len(AGENTS)
 
     while (time.monotonic() - t0) < debate_budget_sec:
+        if debate_budget_sec - (time.monotonic() - t0) < MIN_DEBATE_TURN_SEC:
+            logger.info(
+                "swarm_debate_stop insufficient_turn_budget remaining_sec=%.2f",
+                debate_budget_sec - (time.monotonic() - t0),
+            )
+            break
         visible_line: str | None = None
         visible_agent: dict[str, Any] | None = None
 
@@ -118,53 +138,76 @@ async def run_swarm_session_stream(
             t_llm = time.monotonic()
             parsed: SwarmTurnResponse | None = None
             retry_count = 0
+            turn_cap = max(2.0, debate_budget_sec - (time.monotonic() - t0) - 0.5)
             try:
-                resp = await client.chat.completions.create(
-                    model=debate_model,
-                    response_format={"type": "json_object"},
-                    messages=msgs,
-                    **kw,
-                )
-                raw0 = _synth_raw_from_assistant_message(resp.choices[0].message)
-                try:
-                    parsed = parse_swarm_turn_response(raw0)
-                except Exception as e1:
-                    retry_count = 1
-                    repair = (
-                        f"Your previous output was invalid: {e1}. "
-                        "Return ONLY one JSON object with a valid \"action\" and required fields."
-                    )
-                    msgs2 = prepare_chat_messages(
-                        [
-                            {"role": "system", "content": sys_content},
-                            {"role": "user", "content": user_body},
-                            {"role": "user", "content": repair},
-                        ],
-                        debate_model,
-                        llm,
-                    )
-                    kw2 = _completion_kw_for_messages(base_kw, msgs2, llm, 2048)
-                    resp2 = await client.chat.completions.create(
+                resp = await asyncio.wait_for(
+                    client.chat.completions.create(
                         model=debate_model,
                         response_format={"type": "json_object"},
-                        messages=msgs2,
-                        **kw2,
-                    )
-                    raw1 = _synth_raw_from_assistant_message(resp2.choices[0].message)
+                        messages=msgs,
+                        **kw,
+                    ),
+                    timeout=turn_cap,
+                )
+                msg0 = _first_assistant_message(resp)
+                if msg0 is None:
+                    parsed = None
+                else:
+                    raw0 = _synth_raw_from_assistant_message(msg0)
                     try:
-                        parsed = parse_swarm_turn_response(raw1)
-                    except Exception as e2:
-                        logger.warning(
-                            "swarm JSON parse failed after retry",
-                            extra={
-                                "session_id": session_env.session_id,
-                                "agent_id": agent["id"],
-                                "turn_idx": turn_index,
-                                "errors": str(e2),
-                                "retry_count": retry_count,
-                            },
+                        parsed = parse_swarm_turn_response(raw0)
+                    except Exception as e1:
+                        retry_count = 1
+                        repair = (
+                            f"Your previous output was invalid: {e1}. "
+                            "Return ONLY one JSON object with a valid \"action\" and required fields."
                         )
-                        parsed = None
+                        msgs2 = prepare_chat_messages(
+                            [
+                                {"role": "system", "content": sys_content},
+                                {"role": "user", "content": user_body},
+                                {"role": "user", "content": repair},
+                            ],
+                            debate_model,
+                            llm,
+                        )
+                        kw2 = _completion_kw_for_messages(base_kw, msgs2, llm, 2048)
+                        retry_cap = max(2.0, debate_budget_sec - (time.monotonic() - t0) - 0.5)
+                        resp2 = await asyncio.wait_for(
+                            client.chat.completions.create(
+                                model=debate_model,
+                                response_format={"type": "json_object"},
+                                messages=msgs2,
+                                **kw2,
+                            ),
+                            timeout=retry_cap,
+                        )
+                        msg1 = _first_assistant_message(resp2)
+                        if msg1 is None:
+                            parsed = None
+                        else:
+                            raw1 = _synth_raw_from_assistant_message(msg1)
+                            try:
+                                parsed = parse_swarm_turn_response(raw1)
+                            except Exception as e2:
+                                logger.warning(
+                                    "swarm JSON parse failed after retry",
+                                    extra={
+                                        "session_id": session_env.session_id,
+                                        "agent_id": agent["id"],
+                                        "turn_idx": turn_index,
+                                        "errors": str(e2),
+                                        "retry_count": retry_count,
+                                    },
+                                )
+                                parsed = None
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "swarm turn timed out agent=%s cap_sec=%.1f",
+                    agent["id"],
+                    turn_cap,
+                )
+                parsed = None
             except Exception:
                 logger.warning("swarm LLM call failed", exc_info=True)
                 parsed = None
@@ -275,6 +318,16 @@ async def run_swarm_session_stream(
 
     yield {"type": "debate_phase_end", "turns_completed": turn_index}
 
+    debate_elapsed = time.monotonic() - t0
+    logger.info(
+        "debate_phase_end turns=%s elapsed_sec=%.2f budget_sec=%.2f reserve_sec=%s overrun_sec=%.2f",
+        turn_index,
+        debate_elapsed,
+        debate_budget_sec,
+        SYNTH_RESERVE_SEC,
+        max(0.0, debate_elapsed - debate_budget_sec),
+    )
+
     async for ev in run_post_debate_phases(
         client,
         context=context,
@@ -285,5 +338,6 @@ async def run_swarm_session_stream(
         session_env_box=[session_env],
         synth_env_snapshot=synth_env_snapshot,
         effective_track=effective_track,
+        session_deadline=session_deadline,
     ):
         yield ev

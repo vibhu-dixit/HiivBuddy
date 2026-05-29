@@ -12,9 +12,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.captcha import captcha_bypass_enabled, captcha_secret_configured
 from app.auth.deps import get_current_user
 from app.auth.rate_limit import enforce_guest_debate_rate_limit
-from app.auth.router import is_guest_user, router as auth_router
+from app.auth.router import guest_auth_enabled, is_guest_user, router as auth_router
 from app.db import models  # noqa: F401 — register models before routes
 from app.db.models import DebateRun, User
 from app.db.prune import prune_all_users_excess_runs, prune_excess_runs_for_user
@@ -97,7 +98,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    guest_enabled = guest_auth_enabled()
+    captcha_ready = captcha_bypass_enabled() or captcha_secret_configured()
+    return {
+        "status": "ok",
+        "guest_demo": {
+            "enabled": guest_enabled,
+            "captcha_configured": captcha_ready,
+            "ready": guest_enabled and captcha_ready,
+        },
+    }
 
 
 @app.post("/context/extract")
@@ -105,7 +115,7 @@ async def context_extract(
     file: UploadFile = File(...),
     _: User = Depends(get_current_user),
 ):
-    """Extract text from .txt / .md / .pdf for Decision Room context (max 64k chars extracted)."""
+    """Extract text from .txt / .md / .pdf for Decision Room context (max 500 chars extracted)."""
     return await extract_text_from_upload(file)
 
 
@@ -183,16 +193,27 @@ async def debate_event_stream(
                     ),
                 )
             elif et == "debate_phase_end":
+                logger.info(
+                    "sse debate_phase_end turns=%s",
+                    event.get("turns_completed", 0),
+                )
                 transcript_parts.append(
                     f"--- Debate phase end (turns: {event.get('turns_completed', 0)}) ---",
                 )
+            elif et == "decision_options":
+                logger.info("sse decision_options count=%s", len(event.get("options") or []))
+            elif et == "vote_phase_start":
+                logger.info("sse vote_phase_start")
+                transcript_parts.append("--- Vote phase ---")
+            elif et == "synthesizer_start":
+                logger.info("sse synthesizer_start")
+            elif et == "final_report":
+                logger.info("sse final_report")
             elif et == "agent_decision_trace":
                 transcript_parts.append(
                     "--- Agent stance trace ---\n"
                     + json.dumps(event.get("stances") or [], ensure_ascii=False),
                 )
-            elif et == "vote_phase_start":
-                transcript_parts.append("--- Vote phase ---")
             elif et == "agent_end" and event.get("full_text"):
                 aid = event.get("agent") or ""
                 name = AGENT_NAMES.get(str(aid), str(aid))

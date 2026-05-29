@@ -30,8 +30,8 @@ import { buildSessionMarkdown, downloadMarkdownFile } from "./sessionExportMarkd
 import type { Turn } from "./debateTypes";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-/** Must match API `MAX_EXTRACTED_CHARS` in context_ingest.py */
-const MAX_CONTEXT_CHARS = 65536;
+/** Must match API `MAX_CONTEXT_CHARS` in context_ingest.py */
+const MAX_CONTEXT_CHARS = 500;
 
 /** UI removed — fixed request shape; model IDs come from API `LLM_DEFAULT_MODEL` / tier env only. */
 const FIXED_CONSENSUS_THRESHOLD = 3;
@@ -81,6 +81,10 @@ type InterjectionEvent = {
   text: string;
 };
 type VotePhaseStart = { type: "vote_phase_start" };
+type DecisionOptions = {
+  type: "decision_options";
+  options: { id: string; title: string }[];
+};
 type VoteOptions = {
   type: "vote_options";
   options: { id: string; title: string }[];
@@ -131,6 +135,7 @@ type StreamEvent =
   | InterjectionEvent
   | SessionStart
   | VotePhaseStart
+  | DecisionOptions
   | VoteOptions
   | VoteCast
   | VoteTally
@@ -1095,6 +1100,7 @@ function DecisionRoomContent() {
             chiefSynthPending={selectedArchive ? false : chiefSynthPending}
             environmentPeek={displayEnvironmentPeek}
             hideTechnical={isGuest}
+            showOptionsAfterDebate={Boolean(selectedArchive) || debatePhaseOver}
             runId={selectedArchive ? null : runId}
             debateScrollRef={debateScrollRef}
           />

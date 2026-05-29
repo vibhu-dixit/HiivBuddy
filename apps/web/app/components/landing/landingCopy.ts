@@ -120,13 +120,6 @@ export const USE_CASES = [
   },
 ] as const;
 
-export const DEMO_SAMPLE_CONTEXT = `We are a 12-person B2B SaaS company at $1.2M ARR. Our largest customer wants a custom integration that would tie up one engineer for about three months and push back our core roadmap.
-
-Options we are weighing:
-1) Build the integration to protect roughly $400k ARR
-2) Offer a lighter workaround and protect the roadmap
-3) Walk away and accept churn risk
-
-Constraints: about 14 months of runway, a tired team after a hard quarter, and a hire-vs-contractor call in Q3 we cannot postpone.
-
-A good outcome: one decision we can commit to this week, with risks spelled out and clear next steps for sales and product.`;
+export const DEMO_SAMPLE_CONTEXT = `How do we build a product that customers actually love and will pay for?
+And how do we survive long enough to scale it before running out of money?
+`;

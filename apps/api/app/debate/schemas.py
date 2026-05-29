@@ -4,11 +4,20 @@ from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
+from app.context_ingest import MAX_CONTEXT_CHARS
+
 
 # Subtracted from debate time so the session clock leaves room for closing + synthesis.
 SYNTH_RESERVE_SEC = 30
-# Hard limit for the Chief Synthesizer HTTP call only (`asyncio.wait_for`). Separate from
-# SYNTH_RESERVE_SEC: the debate budget uses 30s on the clock; synthesis often needs longer on slow APIs.
+# Within the reserve: max wall time for vote extraction before Chief Synthesizer must start.
+CLOSING_VOTE_MAX_SEC = 18
+# Minimum seconds reserved for the Chief Synthesizer call within SYNTH_RESERVE_SEC.
+SYNTH_MIN_SEC = 10
+# Do not start a new debate LLM turn when less than this remains on the debate budget.
+MIN_DEBATE_TURN_SEC = 6
+# Max wall time to generate decision options when the brief has no numbered list.
+OPTION_SEED_MAX_SEC = 12
+# Hard limit for the Chief Synthesizer HTTP call (`asyncio.wait_for`); capped by session deadline at runtime.
 SYNTH_API_TIMEOUT_SEC = 90
 
 
@@ -36,7 +45,12 @@ class EnvLimitsPayload(BaseModel):
 
 
 class DebateRequest(BaseModel):
-    context: str = Field(..., min_length=10, description="User decision context")
+    context: str = Field(
+        ...,
+        min_length=10,
+        max_length=MAX_CONTEXT_CHARS,
+        description="User decision context",
+    )
     model: str = Field(
         default_factory=_default_chat_model,
         description="Chat model id (defaults to LLM_DEFAULT_MODEL from API .env)",

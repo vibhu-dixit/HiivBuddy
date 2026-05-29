@@ -13,14 +13,15 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from app.debate.environment import DebateEnvironment, EnvLimits
+from app.debate.environment import DebateEnvironment, DebateOption, EnvLimits
 from app.debate.environment_adapter import (
     apply_classic_interjection,
     apply_classic_utter,
     apply_vote_supports,
     merge_vote_options,
 )
-from app.debate.environment_ops import init_environment, snapshot_for_api
+from app.debate.context_options import parse_options_from_context
+from app.debate.environment_ops import init_environment, merge_options, snapshot_for_api
 from app.debate.schemas import (
     AgentStanceItem,
     AgentVoteResponse,
@@ -30,6 +31,8 @@ from app.debate.schemas import (
     RankedOption,
     SYNTH_API_TIMEOUT_SEC,
     SYNTH_RESERVE_SEC,
+    MIN_DEBATE_TURN_SEC,
+    OPTION_SEED_MAX_SEC,
     VoteOptionItem,
     VoteOptionsResponse,
 )
@@ -87,6 +90,23 @@ def _synth_raw_from_assistant_message(msg: Any) -> str:
     if isinstance(r, str) and r.strip():
         return _strip_md_fences(r)
     return "{}"
+
+
+def _first_assistant_message(resp: Any) -> Any | None:
+    """Return the first assistant message, or None if the provider returned no choices."""
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        logger.warning(
+            "LLM completion missing choices model=%s id=%s",
+            getattr(resp, "model", None),
+            getattr(resp, "id", None),
+        )
+        return None
+    try:
+        return choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        logger.warning("LLM completion choices[0] unusable", exc_info=True)
+        return None
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -473,7 +493,10 @@ async def _interjection_reply(
             ),
             **kw,
         )
-        raw = _interjection_content_only(resp.choices[0].message)
+        msg = _first_assistant_message(resp)
+        if msg is None:
+            return None
+        raw = _interjection_content_only(msg)
     except Exception:
         return None
     if not raw or _is_pass_interjection(raw):
@@ -615,6 +638,11 @@ OPTIONS_FALLBACK_SYSTEM = """You extract discrete decision options for a panel v
 Return ONLY valid JSON: {"options": [{"id":"0","title":"short label"}, ...]}
 Use 2 to 4 options, ids "0","1","2","3" in order. Titles must be mutually distinct and reflect main forks from the debate."""
 
+OPTIONS_SEED_SYSTEM = """You prepare a founder decision session before a panel debate.
+Given a brief (questions or narrative), propose 2-4 distinct strategic paths the advisors should argue about and later vote on.
+Return ONLY valid JSON: {"options":[{"id":"0","title":"concrete path under 100 chars"}, ...]}
+Use ids "0","1","2","3" in order. Titles must be specific decision forks—not placeholders like "primary path" or "option A"."""
+
 _DEFAULT_VOTE_OPTIONS = [
     VoteOptionItem(id="0", title="Primary path from the debate"),
     VoteOptionItem(id="1", title="Alternative path from the debate"),
@@ -663,6 +691,190 @@ async def _create_json_completion(
     raise RuntimeError("No LLM model configured for synthesis")
 
 
+def _seconds_until(deadline: float | None) -> float:
+    if deadline is None:
+        return float("inf")
+    return max(0.0, deadline - time.monotonic())
+
+
+def _instant_default_closing() -> ClosingPhaseResponse:
+    default_stances = [
+        AgentStanceItem(agent_id=a["id"], lean="unknown", confidence=0.0, note="")
+        for a in AGENTS
+    ]
+    vote_items = [
+        ClosingVoteItem(agent_id=a["id"], option_id="0", rationale="")
+        for a in AGENTS
+    ]
+    return ClosingPhaseResponse(
+        options=list(_DEFAULT_VOTE_OPTIONS),
+        votes=vote_items,
+        agent_stances=default_stances,
+    )
+
+
+def _heuristic_options_from_context(context: str) -> list[DebateOption]:
+    """Offline fallback when option-seed LLM fails (demo-friendly)."""
+    lower = context.lower()
+    if any(k in lower for k in ("love", "pay", "runway", "money", "scale", "customer")):
+        return [
+            DebateOption(id="0", title="Love-first: retention and NPS before scaling"),
+            DebateOption(id="1", title="Runway-first: revenue and unit economics before growth"),
+            DebateOption(id="2", title="Dual-track: PMF iteration with strict cash guardrails"),
+        ]
+    return [
+        DebateOption(id="0", title="Aggressive path on the stated opportunity"),
+        DebateOption(id="1", title="Conservative path preserving runway and focus"),
+    ]
+
+
+async def ensure_session_options(
+    client: AsyncOpenAI,
+    *,
+    context: str,
+    model: str,
+    llm: Settings,
+    env: DebateEnvironment,
+) -> tuple[DebateEnvironment, list[DebateOption]]:
+    """Parse numbered options from the brief, or generate them before debate starts."""
+    parsed = parse_options_from_context(context)
+    if len(parsed) >= 2:
+        merged = merge_options(env, parsed)
+        logger.info("option_seed_parsed_from_context count=%d", len(parsed))
+        return merged, parsed
+
+    seed_models = _synth_model_candidates(llm, model)
+    seed_user = (
+        f"Decision brief:\n{context.strip()}\n\n"
+        "Return JSON with an options array (2-4 distinct strategic paths) now."
+    )
+    seed_msgs = prepare_chat_messages(
+        [
+            {"role": "system", "content": OPTIONS_SEED_SYSTEM},
+            {"role": "user", "content": seed_user},
+        ],
+        seed_models[0],
+        llm,
+    )
+    try:
+        _, resp = await asyncio.wait_for(
+            _create_json_completion(
+                client,
+                models=seed_models,
+                messages=seed_msgs,
+                llm=llm,
+                max_tokens=512,
+            ),
+            timeout=float(OPTION_SEED_MAX_SEC),
+        )
+        msg = _first_assistant_message(resp)
+        if msg is not None:
+            raw = _synth_raw_from_assistant_message(msg)
+            vo = _parse_json_to_model(raw, VoteOptionsResponse)
+            normalized = _normalize_vote_options(vo)
+            opts = [DebateOption(id=o.id, title=o.title) for o in normalized[:4]]
+            if len(opts) >= 2:
+                merged = merge_options(env, opts)
+                logger.info("option_seed_llm count=%d", len(opts))
+                return merged, opts
+    except asyncio.TimeoutError:
+        logger.warning("option_seed_llm_timed_out budget_sec=%s", OPTION_SEED_MAX_SEC)
+    except Exception:
+        logger.warning("option_seed_llm_failed", exc_info=True)
+
+    fallback = _heuristic_options_from_context(context)
+    merged = merge_options(env, fallback)
+    logger.info("option_seed_heuristic count=%d", len(fallback))
+    return merged, fallback
+
+
+def _closing_from_environment(se: DebateEnvironment | None) -> ClosingPhaseResponse:
+    """Votes from debate: each advisor's last focused option, else panel-wide support leader."""
+    if se is None or len(se.options_by_id) < 2:
+        return _instant_default_closing()
+
+    vote_opts = sorted(
+        [VoteOptionItem(id=o.id, title=o.title) for o in se.options_by_id.values()],
+        key=lambda x: int(x.id) if x.id.isdigit() else 99,
+    )
+    allowed = {o.id for o in vote_opts}
+    panel_pick = vote_opts[0].id
+    if se.option_support_scores:
+        panel_pick = max(
+            allowed,
+            key=lambda k: float(se.option_support_scores.get(k, 0.5)),
+        )
+
+    default_stances = [
+        AgentStanceItem(agent_id=a["id"], lean="unknown", confidence=0.0, note="")
+        for a in AGENTS
+    ]
+    vote_items: list[ClosingVoteItem] = []
+    for a in AGENTS:
+        aid = a["id"]
+        st = se.agent_state_by_id.get(aid)
+        oid = st.focus_option_id if st and st.focus_option_id in allowed else panel_pick
+        vote_items.append(ClosingVoteItem(agent_id=aid, option_id=oid, rationale=""))
+
+    return ClosingPhaseResponse(
+        options=vote_opts,
+        votes=vote_items,
+        agent_stances=default_stances,
+    )
+
+
+def _closing_from_context(context: str) -> ClosingPhaseResponse:
+    """Instant vote phase from parsed context options — no LLM (preserves synth budget)."""
+    parsed_opts = parse_options_from_context(context)
+    if len(parsed_opts) < 2:
+        return _instant_default_closing()
+
+    vote_opts = [
+        VoteOptionItem(id=str(i), title=o.title)
+        for i, o in enumerate(parsed_opts[:4])
+    ]
+    n = len(vote_opts)
+    default_stances = [
+        AgentStanceItem(agent_id=a["id"], lean="unknown", confidence=0.0, note="")
+        for a in AGENTS
+    ]
+    vote_items = [
+        ClosingVoteItem(
+            agent_id=a["id"],
+            option_id=str(i % n),
+            rationale="",
+        )
+        for i, a in enumerate(AGENTS)
+    ]
+    return ClosingPhaseResponse(
+        options=vote_opts,
+        votes=vote_items,
+        agent_stances=default_stances,
+    )
+
+
+async def _parse_closing_from_llm(
+    client: AsyncOpenAI,
+    *,
+    synth_models: list[str],
+    closing_msgs: list[dict[str, Any]],
+    llm: Settings,
+) -> tuple[str, ClosingPhaseResponse]:
+    synth_model, closing_resp = await _create_json_completion(
+        client,
+        models=synth_models,
+        messages=closing_msgs,
+        llm=llm,
+    )
+    closing_msg = _first_assistant_message(closing_resp)
+    if closing_msg is None:
+        raise ValueError("LLM response missing choices")
+    closing_raw = _synth_raw_from_assistant_message(closing_msg)
+    parsed = _parse_json_to_model(closing_raw, ClosingPhaseResponse)
+    assert isinstance(parsed, ClosingPhaseResponse)
+    return synth_model, parsed
+
+
 async def run_post_debate_phases(
     client: AsyncOpenAI,
     *,
@@ -674,126 +886,27 @@ async def run_post_debate_phases(
     session_env_box: list[DebateEnvironment | None],
     synth_env_snapshot: bool,
     effective_track: bool,
+    session_deadline: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Vote extraction, tally, Chief Synthesizer — shared by classic and structured swarm."""
+    t_post0 = time.monotonic()
     threshold = max(1, min(5, consensus_threshold))
     synth_models = _synth_model_candidates(llm, model)
     synth_model = synth_models[0]
-    base_kw = llm.common_completion_kwargs()
     se = session_env_box[0]
+
+    logger.info("post_debate_start vote_phase_begin")
 
     yield {"type": "vote_phase_start"}
 
-    closing_user = (
-        f"Decision context:\n{context}\n\nFull debate transcript:\n{transcript}\n"
-        "Return JSON only matching the system schema (options, votes, agent_stances)."
+    t_vote0 = time.monotonic()
+    parsed_closing = _closing_from_environment(se)
+    vote_phase_sec = time.monotonic() - t_vote0
+    logger.info(
+        "vote_phase_from_debate elapsed_sec=%.3f options=%d",
+        vote_phase_sec,
+        len(parsed_closing.options),
     )
-    parsed_closing: ClosingPhaseResponse | None = None
-    try:
-        closing_msgs = prepare_chat_messages(
-            [
-                {"role": "system", "content": CLOSING_SYSTEM},
-                {"role": "user", "content": closing_user},
-            ],
-            synth_model,
-            llm,
-        )
-        synth_model, closing_resp = await _create_json_completion(
-            client,
-            models=synth_models,
-            messages=closing_msgs,
-            llm=llm,
-        )
-        closing_raw = _synth_raw_from_assistant_message(closing_resp.choices[0].message)
-        parsed_closing = _parse_json_to_model(closing_raw, ClosingPhaseResponse)
-    except Exception:
-        parsed_closing = None
-
-    if parsed_closing is None:
-        opts_user = (
-            f"Decision context:\n{context}\n\nFull debate transcript:\n{transcript}\n"
-            'Return JSON only with shape {"options":[{"id":"0","title":"..."},...]} (2-4 options).'
-        )
-        opt_msgs = prepare_chat_messages(
-            [
-                {"role": "system", "content": OPTIONS_FALLBACK_SYSTEM},
-                {"role": "user", "content": opts_user},
-            ],
-            synth_model,
-            llm,
-        )
-        vote_opts_fb = list(_DEFAULT_VOTE_OPTIONS)
-        try:
-            synth_model, opt_resp = await _create_json_completion(
-                client,
-                models=synth_models,
-                messages=opt_msgs,
-                llm=llm,
-            )
-            opt_raw = _synth_raw_from_assistant_message(opt_resp.choices[0].message)
-            vote_opts_fb = _normalize_vote_options(_parse_json_to_model(opt_raw, VoteOptionsResponse))
-        except Exception:
-            logger.warning("Vote option extraction failed; using default options", exc_info=True)
-        allowed_ids_fb = {o.id for o in vote_opts_fb}
-        opts_lines = "\n".join(f"  id={o.id}: {o.title}" for o in vote_opts_fb)
-
-        async def _one_vote(agent: dict[str, str]) -> ClosingVoteItem:
-            vote_user = (
-                f"Decision context:\n{context}\n\nDebate summary is in the transcript you do not need to repeat.\n"
-                f"Voting options:\n{opts_lines}\n\n"
-                f"You are {agent['name']}. Vote for exactly ONE option by its id (0, 1, 2, …). "
-                "Return JSON only: "
-                '{"option_id":"<id as string>","rationale":"<one short sentence>"}'
-            )
-            vote_msgs = prepare_chat_messages(
-                [
-                    {"role": "system", "content": agent["system"]},
-                    {"role": "user", "content": vote_user},
-                ],
-                synth_model,
-                llm,
-            )
-            try:
-                _, vresp = await _create_json_completion(
-                    client,
-                    models=synth_models,
-                    messages=vote_msgs,
-                    llm=llm,
-                    max_tokens=512,
-                )
-                vraw = _synth_raw_from_assistant_message(vresp.choices[0].message)
-                vparsed = _parse_json_to_model(vraw, AgentVoteResponse)
-                assert isinstance(vparsed, AgentVoteResponse)
-                oid = (vparsed.option_id or "").strip()
-                rationale = (vparsed.rationale or "")[:300]
-            except Exception:
-                oid = min(allowed_ids_fb, key=lambda x: int(x))
-                rationale = ""
-            if oid not in allowed_ids_fb:
-                try:
-                    cand = str(int(float(oid)))
-                    if cand in allowed_ids_fb:
-                        oid = cand
-                    else:
-                        oid = min(allowed_ids_fb, key=lambda x: int(x))
-                except (ValueError, TypeError):
-                    oid = min(allowed_ids_fb, key=lambda x: int(x))
-            return ClosingVoteItem(
-                agent_id=agent["id"],
-                option_id=oid,
-                rationale=rationale,
-            )
-
-        vote_items = await asyncio.gather(*[_one_vote(a) for a in AGENTS])
-        default_stances = [
-            AgentStanceItem(agent_id=a["id"], lean="unknown", confidence=0.0, note="")
-            for a in AGENTS
-        ]
-        parsed_closing = ClosingPhaseResponse(
-            options=vote_opts_fb,
-            votes=list(vote_items),
-            agent_stances=default_stances,
-        )
 
     vote_opts = _normalize_vote_options(VoteOptionsResponse(options=parsed_closing.options))
     allowed_ids = {o.id for o in vote_opts}
@@ -857,6 +970,13 @@ async def run_post_debate_phases(
 
     yield {"type": "synthesizer_start"}
 
+    vote_total_sec = time.monotonic() - t_post0
+    logger.info(
+        "synthesizer_start vote_phase_total_sec=%.2f synth_timeout_sec=%s",
+        vote_total_sec,
+        SYNTH_API_TIMEOUT_SEC,
+    )
+
     vote_summary = json.dumps(
         {
             "tallies": tallies,
@@ -908,16 +1028,30 @@ async def run_post_debate_phases(
     ]
 
     try:
+        t_synth0 = time.monotonic()
+        synth_timeout = min(float(SYNTH_API_TIMEOUT_SEC), _seconds_until(session_deadline))
+        logger.info("synthesizer_llm_begin timeout_sec=%.2f", synth_timeout)
+        if synth_timeout <= 0:
+            raise asyncio.TimeoutError("no time left for synthesizer")
         _, resp = await asyncio.wait_for(
             _create_json_completion(
                 client,
                 models=synth_models,
                 messages=synth_msgs,
                 llm=llm,
+                max_tokens=2048,
             ),
-            timeout=float(SYNTH_API_TIMEOUT_SEC),
+            timeout=synth_timeout,
         )
+        synth_llm_sec = time.monotonic() - t_synth0
+        logger.info("synthesizer_llm_done elapsed_sec=%.2f", synth_llm_sec)
     except asyncio.TimeoutError:
+        synth_llm_sec = time.monotonic() - t_synth0
+        logger.warning(
+            "synthesizer_llm_timeout elapsed_sec=%.2f limit=%.2f",
+            synth_llm_sec,
+            synth_timeout,
+        )
         report = FinalReport(
             summary=(
                 "The Chief Synthesizer hit the server time limit while generating the report. "
@@ -944,7 +1078,9 @@ async def run_post_debate_phases(
         )
     else:
         try:
-            msg = resp.choices[0].message
+            msg = _first_assistant_message(resp)
+            if msg is None:
+                raise ValueError("LLM response missing choices")
             raw = _synth_raw_from_assistant_message(msg)
             report = _parse_final_report(raw)
         except Exception:
@@ -970,6 +1106,11 @@ async def run_post_debate_phases(
     final_payload: dict[str, Any] = {"type": "final_report", "report": report.model_dump()}
     if env_snap_final is not None:
         final_payload["env_snapshot"] = env_snap_final
+    post_total_sec = time.monotonic() - t_post0
+    logger.info(
+        "final_report_ready post_debate_total_sec=%.2f (vote+synth)",
+        post_total_sec,
+    )
     yield final_payload
 
 
@@ -1002,6 +1143,8 @@ async def run_debate_stream(
         "synth_reserve_sec": SYNTH_RESERVE_SEC,
     }
 
+    session_deadline = t0 + float(total_sec)
+
     effective_track = track_environment
     need_env = effective_track or synth_env_snapshot
     limits = env_limits or EnvLimits()
@@ -1024,6 +1167,12 @@ async def run_debate_stream(
     turn_index = 0
     last_primary_speech = ""
     while not _debate_deadline_elapsed(t0, debate_budget_sec):
+        if debate_budget_sec - (time.monotonic() - t0) < MIN_DEBATE_TURN_SEC:
+            logger.info(
+                "debate_phase_stop insufficient_turn_budget remaining_sec=%.2f",
+                debate_budget_sec - (time.monotonic() - t0),
+            )
+            break
         agent = rotation_order[rr % n_agents]
         rr += 1
         turn_index += 1
@@ -1194,6 +1343,16 @@ async def run_debate_stream(
 
     yield {"type": "debate_phase_end", "turns_completed": turn_index}
 
+    debate_elapsed = time.monotonic() - t0
+    logger.info(
+        "debate_phase_end turns=%s elapsed_sec=%.2f budget_sec=%.2f reserve_sec=%s overrun_sec=%.2f",
+        turn_index,
+        debate_elapsed,
+        debate_budget_sec,
+        SYNTH_RESERVE_SEC,
+        max(0.0, debate_elapsed - debate_budget_sec),
+    )
+
     async for ev in run_post_debate_phases(
         client,
         context=context,
@@ -1204,5 +1363,6 @@ async def run_debate_stream(
         session_env_box=[session_env],
         synth_env_snapshot=synth_env_snapshot,
         effective_track=effective_track,
+        session_deadline=t0 + total_sec,
     ):
         yield ev

@@ -10,8 +10,9 @@ from fastapi import HTTPException, UploadFile
 
 # Raw upload cap (bytes) before extraction.
 MAX_UPLOAD_BYTES: Final[int] = 8 * 1024 * 1024
-# Extracted UTF-8 text cap (characters).
-MAX_EXTRACTED_CHARS: Final[int] = 65536
+# Debate context cap (characters) — also enforced on POST /debate/stream and in the web UI.
+MAX_CONTEXT_CHARS: Final[int] = 500
+MAX_EXTRACTED_CHARS: Final[int] = MAX_CONTEXT_CHARS
 
 _TEXT_LIKE = frozenset(
     {
