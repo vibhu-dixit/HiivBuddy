@@ -230,7 +230,7 @@ def apply_action(env: DebateEnvironment, action: AgentAction) -> ApplyResult:
             oid: _clamp01(cur - float(action.delta)),
         }
         st = nxt.agent_state_by_id[action.agent_id].model_copy(
-            update={"last_step_index": new_step, "focus_option_id": oid},
+            update={"last_step_index": new_step},
         )
         nxt.agent_state_by_id = {**nxt.agent_state_by_id, action.agent_id: st}
         nxt.hooks = EnvHooks(

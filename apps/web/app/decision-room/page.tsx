@@ -17,6 +17,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { DEMO_SAMPLE_CONTEXT } from "../components/landing/landingCopy";
 
 import { ChamberSeats } from "./ChamberSeats";
+import { DEBATE_AGENTS } from "./debateAgents";
 import { DebateTranscript } from "./DebateTranscript";
 import type { StoredDebate } from "./debateHistory";
 import {
@@ -24,9 +25,12 @@ import {
   clearDebatesForUser,
   loadDebates,
   removeDebate,
+  type StoredVoteTally,
 } from "./debateHistory";
 import { isTurnVisibleToUser, sanitizeDebateTurnText } from "./displayDebateText";
 import { buildSessionMarkdown, downloadMarkdownFile } from "./sessionExportMarkdown";
+import { PANEL_MEMBER_ROLES } from "./panelMemberCopy";
+import { SessionOutcomePanel } from "./SessionOutcomePanel";
 import type { Turn } from "./debateTypes";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
@@ -182,6 +186,41 @@ function formatSavedAt(iso: string): string {
   }
 }
 
+function deriveHighLevelResult(
+  report: ReportState | null,
+  voteTally: StoredVoteTally | null,
+): string | null {
+  if (report?.summary?.trim()) return report.summary.trim();
+  if (report?.ranked_options?.[0]?.title) {
+    const top = report.ranked_options[0];
+    return top.rationale?.trim()
+      ? `${top.title} — ${top.rationale.trim()}`
+      : top.title;
+  }
+  if (voteTally?.consensus_reached && voteTally.winning_title) {
+    return `The panel reached consensus on: ${voteTally.winning_title}.`;
+  }
+  if (voteTally && Object.keys(voteTally.tallies).length > 0) {
+    const [topId, topCount] = Object.entries(voteTally.tallies).sort(
+      (a, b) => b[1] - a[1],
+    )[0];
+    const label = voteTally.winning_title || `option ${topId}`;
+    return `No full consensus at threshold. Leading path (${topCount} of ${DEBATE_AGENTS.length} votes): ${label}.`;
+  }
+  return null;
+}
+
+function deriveVoteHint(voteTally: StoredVoteTally | null): string | null {
+  if (!voteTally) return null;
+  if (voteTally.consensus_reached && voteTally.winning_title) {
+    return `Panel vote: consensus on “${voteTally.winning_title}”.`;
+  }
+  if (Object.keys(voteTally.tallies).length > 0) {
+    return "Panel vote recorded. Final brief is being written.";
+  }
+  return null;
+}
+
 function DecisionRoomContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -247,10 +286,13 @@ function DecisionRoomContent() {
   /** Swarm mode has no token stream; keep seat ring lit briefly after each turn. */
   const [floorAgentId, setFloorAgentId] = useState<string | null>(null);
   const [flashAgentId, setFlashAgentId] = useState<string | null>(null);
+  const [setupHighlightId, setSetupHighlightId] = useState<string | null>(null);
   const flashClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const floorClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runIdRef = useRef<number | null>(null);
   const debateScrollRef = useRef<HTMLDivElement | null>(null);
+  const outcomePanelRef = useRef<HTMLDivElement | null>(null);
+  const scrollLiveDebateRef = useRef(false);
 
   const [debateHistory, setDebateHistory] = useState<StoredDebate[]>([]);
   const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
@@ -446,6 +488,28 @@ function DecisionRoomContent() {
     return activeMemberId;
   }, [synthesizerActive, flashAgentId, floorAgentId, streamingAgentId, activeMemberId]);
 
+  const showRoomSetup = Boolean(
+    !selectedArchiveId && running && turns.length === 0,
+  );
+  const roomSetupPhase: "connecting" | "preparing" =
+    sessionClock === null ? "connecting" : "preparing";
+  const chamberHighlightId = showRoomSetup ? setupHighlightId : agentHighlightId;
+
+  useEffect(() => {
+    if (!showRoomSetup) {
+      setSetupHighlightId(null);
+      return;
+    }
+    const ids = PANEL_MEMBER_ROLES.map((m) => m.id);
+    let index = 0;
+    setSetupHighlightId(ids[0] ?? null);
+    const timer = setInterval(() => {
+      index = (index + 1) % ids.length;
+      setSetupHighlightId(ids[index] ?? null);
+    }, 2200);
+    return () => clearInterval(timer);
+  }, [showRoomSetup]);
+
   const selectedArchive = useMemo(
     () => (selectedArchiveId ? debateHistory.find((d) => d.id === selectedArchiveId) : null),
     [debateHistory, selectedArchiveId],
@@ -481,8 +545,27 @@ function DecisionRoomContent() {
   );
 
   const canExportMarkdown = useMemo(
-    () => hasExportableBody && (!running || selectedArchiveId !== null),
-    [hasExportableBody, running, selectedArchiveId],
+    () =>
+      hasExportableBody &&
+      (!running || selectedArchiveId !== null || chiefSynthPending),
+    [hasExportableBody, running, selectedArchiveId, chiefSynthPending],
+  );
+
+  const highLevelResult = useMemo(
+    () => deriveHighLevelResult(displayReport, displayVoteTally),
+    [displayReport, displayVoteTally],
+  );
+
+  const showSessionOutcome = Boolean(highLevelResult) && (
+    selectedArchiveId !== null ||
+    chiefSynthPending ||
+    (!running && (debatePhaseOver || displayVoteTally !== null))
+  );
+  const outcomeStatus: "synthesizing" | "complete" =
+    displayReport !== null ? "complete" : "synthesizing";
+  const voteHint = useMemo(
+    () => (displayReport ? null : deriveVoteHint(displayVoteTally)),
+    [displayReport, displayVoteTally],
   );
 
   const handleExportMarkdown = useCallback(() => {
@@ -540,19 +623,29 @@ function DecisionRoomContent() {
   useLayoutEffect(() => {
     const el = debateScrollRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+
+    const liveDebate = running && !debatePhaseOver;
+    if (liveDebate) {
+      scrollLiveDebateRef.current = true;
+      el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+      return;
+    }
+
+    if (scrollLiveDebateRef.current && !running) {
+      scrollLiveDebateRef.current = false;
+      el.scrollTo({ top: 0, behavior: "auto" });
+    }
   }, [
-    displayTurns,
-    displayError,
-    displayVoteOptions,
-    displayVoteTally,
-    displayReport,
-    runId,
-    currentAgent,
+    running,
     debatePhaseOver,
-    selectedArchiveId,
-    displayEnvironmentPeek,
+    displayTurns.length,
+    currentAgent,
   ]);
+
+  useEffect(() => {
+    if (!showSessionOutcome || running) return;
+    outcomePanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [showSessionOutcome, running, displayReport]);
 
   useEffect(() => {
     if (isGuest || running) return;
@@ -955,40 +1048,68 @@ function DecisionRoomContent() {
         </div>
       </header>
 
-      {/* Mobile: chamber → history → form → debate. Desktop: chamber+timer | history; debate | form */}
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_minmax(320px,440px)] lg:grid-rows-[auto_minmax(0,1fr)] lg:gap-6">
-        {/* Row 1 col 1 — Chamber + debate-phase timer bottom-right */}
-        <aside className="order-1 flex min-h-0 min-w-0 flex-col lg:col-start-1 lg:row-start-1">
-          <ChamberSeats
-            synthesizerActive={synthesizerActive}
-            agentHighlightId={agentHighlightId}
-            bottomRight={
-              running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver ? (
-                <div
-                  className="rounded-lg border border-white/15 bg-[var(--background)]/95 px-2.5 py-2 text-left shadow-lg backdrop-blur-sm"
-                  aria-live="polite"
-                >
-                  <p className="text-[9px] font-medium uppercase tracking-wide text-[var(--muted)]">
-                    Debate phase
-                  </p>
-                  <p className="mt-1 text-[11px] leading-snug text-[var(--muted)] sm:text-xs">
-                    <span className="font-semibold tabular-nums text-[var(--foreground)]">
-                      {debateSecondsLeft}s
-                    </span>{" "}
-                    left · {sessionClock.session_duration_sec}s session · {sessionClock.synth_reserve_sec}s closing
-                  </p>
-                </div>
-              ) : undefined
-            }
-          />
-        </aside>
+      {/* Mobile: chamber → history → context → debate. Desktop: left column (chamber+debate) | right column (context) — independent heights */}
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_minmax(320px,440px)] lg:grid-rows-1 lg:items-stretch lg:gap-6">
+        {/* Left column — chamber + debate (height not tied to context panel) */}
+        <div className="contents lg:flex lg:min-h-0 lg:flex-col lg:gap-4 lg:overflow-hidden">
+          <aside className="order-1 flex min-h-0 min-w-0 shrink-0 flex-col">
+            <ChamberSeats
+              synthesizerActive={synthesizerActive}
+              agentHighlightId={chamberHighlightId}
+              bottomRight={
+                running && sessionClock && debateSecondsLeft !== null && !debatePhaseOver ? (
+                  <div
+                    className="rounded-lg border border-[var(--border)] bg-[var(--background)]/95 px-2.5 py-2 text-left shadow-lg backdrop-blur-sm"
+                    aria-live="polite"
+                  >
+                    <p className="text-[9px] font-medium uppercase tracking-wide text-[var(--muted)]">
+                      Debate phase
+                    </p>
+                    <p className="mt-1 text-[11px] leading-snug text-[var(--muted)] sm:text-xs">
+                      <span className="font-semibold tabular-nums text-[var(--foreground)]">
+                        {debateSecondsLeft}s
+                      </span>{" "}
+                      left · {sessionClock.session_duration_sec}s session · {sessionClock.synth_reserve_sec}s closing
+                    </p>
+                  </div>
+                ) : undefined
+              }
+            />
+          </aside>
 
-        {/* Row 1 col 2 — History (registered users only; demo sessions are ephemeral) */}
-        {!isGuest && (
-        <section
-          className="order-2 flex max-h-40 min-h-0 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-2 lg:row-start-1 lg:max-h-none lg:min-h-0 lg:self-stretch"
-          aria-label="Saved debates"
-        >
+          <section
+            className="order-4 flex min-h-[min(42vh,360px)] min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]/30 lg:min-h-0"
+            aria-label="Debate transcript"
+          >
+            <DebateTranscript
+              error={displayError}
+              currentAgent={selectedArchive ? null : currentAgent}
+              running={selectedArchive ? false : running}
+              turns={displayTurns}
+              voteOptions={displayVoteOptions}
+              voteTally={displayVoteTally}
+              report={displayReport}
+              chiefSynthPending={selectedArchive ? false : chiefSynthPending}
+              environmentPeek={displayEnvironmentPeek}
+              hideTechnical={isGuest}
+              showOptionsAfterDebate={Boolean(selectedArchive) || debatePhaseOver}
+              showRoomSetup={showRoomSetup}
+              roomSetupPhase={roomSetupPhase}
+              setupActiveAgentId={setupHighlightId}
+              collapseReport={Boolean(isGuest && showSessionOutcome && displayReport)}
+              runId={selectedArchive ? null : runId}
+              debateScrollRef={debateScrollRef}
+            />
+          </section>
+        </div>
+
+        {/* Right column — scrolls on its own; resizing context does not shrink debate */}
+        <div className="contents lg:flex lg:min-h-0 lg:flex-col lg:gap-4 lg:overflow-y-auto lg:overscroll-contain lg:col-start-2 lg:row-start-1">
+          {!isGuest && (
+          <section
+            className="order-2 flex max-h-40 min-h-0 shrink-0 flex-col overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]/30 lg:max-h-[min(28vh,240px)]"
+            aria-label="Saved debates"
+          >
           <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">History</h2>
             {selectedArchiveId !== null && (
@@ -1067,52 +1188,10 @@ function DecisionRoomContent() {
             </ul>
           </nav>
         </section>
-        )}
+          )}
 
-        {/* Row 2 col 1 — Debate transcript (full width of column) */}
-        <section
-          className="order-4 flex min-h-[min(42vh,360px)] min-w-0 flex-col overflow-hidden rounded-xl border border-white/10 bg-[var(--card)]/30 lg:col-start-1 lg:row-start-2 lg:min-h-0 lg:self-stretch"
-          aria-label="Debate transcript"
-        >
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-b border-white/10 px-3 py-2">
-            <button
-              type="button"
-              onClick={handleExportMarkdown}
-              disabled={!canExportMarkdown}
-              title={
-                canExportMarkdown
-                  ? "Download this session as a Markdown file"
-                  : "Run a session or open History to export"
-              }
-              className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Export Markdown
-            </button>
-          </div>
-          <DebateTranscript
-            error={displayError}
-            currentAgent={selectedArchive ? null : currentAgent}
-            running={selectedArchive ? false : running}
-            turns={displayTurns}
-            voteOptions={displayVoteOptions}
-            voteTally={displayVoteTally}
-            report={displayReport}
-            chiefSynthPending={selectedArchive ? false : chiefSynthPending}
-            environmentPeek={displayEnvironmentPeek}
-            hideTechnical={isGuest}
-            showOptionsAfterDebate={Boolean(selectedArchive) || debatePhaseOver}
-            runId={selectedArchive ? null : runId}
-            debateScrollRef={debateScrollRef}
-          />
-        </section>
-
-        {/* Row 2 col 2 — Context & controls */}
-        <section
-          className={`order-3 flex min-h-0 flex-col gap-4 overflow-y-auto lg:col-start-2 lg:max-h-full lg:self-stretch ${
-            isGuest ? "lg:row-start-1" : "lg:row-start-2"
-          }`}
-        >
-          <div className="flex shrink-0 flex-col gap-3 rounded-xl border border-white/10 bg-[var(--card)]/40 p-4">
+          <div className="order-3 flex shrink-0 flex-col gap-4">
+          <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--card)]/40 p-4">
             <div className="flex w-full flex-col gap-2">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <span className="text-sm font-medium">Context</span>
@@ -1172,7 +1251,7 @@ function DecisionRoomContent() {
               ) : null}
               <textarea
                 rows={4}
-                className="min-h-[5.5rem] w-full resize-y rounded-lg border border-white/10 bg-[var(--card)] p-2.5 text-sm outline-none ring-[var(--accent)] focus:ring-2"
+                className="max-h-56 min-h-[5.5rem] w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--card)] p-2.5 text-sm outline-none ring-[var(--accent)] focus:ring-2"
                 placeholder="Describe the decision, constraints, and what a good outcome looks like…"
                 value={context}
                 onChange={(e) => {
@@ -1227,7 +1306,20 @@ function DecisionRoomContent() {
               </div>
             </div>
           </div>
-        </section>
+
+            {showSessionOutcome && highLevelResult && (
+              <div ref={outcomePanelRef}>
+                <SessionOutcomePanel
+                  status={outcomeStatus}
+                  highLevelResult={highLevelResult}
+                  voteHint={voteHint}
+                  canDownload={canExportMarkdown}
+                  onDownload={handleExportMarkdown}
+                />
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </main>
   );

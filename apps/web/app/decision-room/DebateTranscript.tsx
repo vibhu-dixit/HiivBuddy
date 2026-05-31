@@ -6,6 +6,7 @@ import { DEBATE_AGENTS } from "./debateAgents";
 import type { Turn } from "./debateTypes";
 import type { StoredVoteTally } from "./debateHistory";
 import { isTurnVisibleToUser, sanitizeDebateTurnText } from "./displayDebateText";
+import { RoomSetupPanel } from "./RoomSetupPanel";
 
 type VoteOpts = { id: string; title: string }[] | null;
 
@@ -16,6 +17,48 @@ type Report = {
   next_steps: string[];
   env_snapshot?: unknown;
 } | null;
+
+type ReportBodyProps = {
+  report: NonNullable<Report>;
+};
+
+function ReportBody({ report }: ReportBodyProps) {
+  return (
+    <>
+      <p className="mt-3 text-sm leading-relaxed">{report.summary}</p>
+      <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+        Ranked options
+      </h3>
+      <ul className="mt-2 flex flex-col gap-2">
+        {report.ranked_options.map((o) => (
+          <li key={o.title} className="rounded-md border border-[var(--border)] p-3 text-sm">
+            <div className="flex justify-between gap-2">
+              <span className="font-medium">{o.title}</span>
+              <span className="text-[var(--muted)]">{(o.score * 100).toFixed(0)}%</span>
+            </div>
+            <p className="mt-1 text-[var(--muted)]">{o.rationale}</p>
+          </li>
+        ))}
+      </ul>
+      <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+        Risks
+      </h3>
+      <ul className="mt-1 list-inside list-disc text-sm text-[var(--muted)]">
+        {report.risks.map((r) => (
+          <li key={r}>{r}</li>
+        ))}
+      </ul>
+      <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+        Next steps
+      </h3>
+      <ul className="mt-1 list-inside list-decimal text-sm">
+        {report.next_steps.map((s) => (
+          <li key={s}>{s}</li>
+        ))}
+      </ul>
+    </>
+  );
+}
 
 type Props = {
   error: string | null;
@@ -33,6 +76,11 @@ type Props = {
   hideTechnical?: boolean;
   /** Hide decision/vote options until the debate phase has finished (live sessions only). */
   showOptionsAfterDebate?: boolean;
+  showRoomSetup?: boolean;
+  roomSetupPhase?: "connecting" | "preparing";
+  setupActiveAgentId?: string | null;
+  /** Hide duplicate full report in transcript when sidebar outcome panel is shown (guest demo). */
+  collapseReport?: boolean;
 };
 
 export function DebateTranscript({
@@ -49,14 +97,20 @@ export function DebateTranscript({
   debateScrollRef,
   hideTechnical = false,
   showOptionsAfterDebate = true,
+  showRoomSetup = false,
+  roomSetupPhase = "connecting",
+  setupActiveAgentId = null,
+  collapseReport = false,
 }: Props) {
+  const sessionFinished = !running && Boolean(voteTally || report);
+
   return (
     <div
       ref={debateScrollRef}
       className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3 sm:p-4 [scrollbar-gutter:stable]"
     >
       {error && (
-        <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+        <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-700">
           {error}
         </p>
       )}
@@ -72,11 +126,21 @@ export function DebateTranscript({
         </p>
       )}
 
+      {showRoomSetup && (
+        <RoomSetupPanel phase={roomSetupPhase} activeAgentId={setupActiveAgentId} />
+      )}
+
+      {sessionFinished && (
+        <p className="rounded-lg border border-[var(--border)] bg-[var(--card)] px-3 py-2 text-xs text-[var(--muted)]">
+          Full transcript, votes, and decision brief are below. Your summary is in the panel on the right.
+        </p>
+      )}
+
       <section className="flex min-h-0 flex-1 flex-col gap-3">
         <h2 className="shrink-0 text-sm font-medium text-[var(--muted)]">Debate</h2>
         <div className="flex min-h-0 flex-1 flex-col gap-4">
-          {turns.length === 0 && !running && (
-            <p className="rounded-lg border border-dashed border-white/15 bg-[var(--card)]/40 px-4 py-10 text-center text-sm leading-relaxed text-[var(--muted)]">
+          {turns.length === 0 && !running && !showRoomSetup && (
+            <p className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--card)] px-4 py-10 text-center text-sm leading-relaxed text-[var(--muted)]">
               Panel discussion appears here when you run a debate. Each advisor&apos;s turn will
               stream into this panel.
             </p>
@@ -96,13 +160,13 @@ export function DebateTranscript({
                 <article
                   className={
                     t.kind === "interjection"
-                      ? "rounded-lg border border-amber-500/40 bg-amber-950/20 p-4"
-                      : "rounded-lg border border-white/10 bg-[var(--card)] p-4"
+                      ? "rounded-lg border border-amber-500/35 bg-amber-50 p-4"
+                      : "rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
                   }
                 >
                   <h4 className="text-sm font-semibold text-[var(--accent)]">{t.name}</h4>
                   {t.kind === "interjection" && t.targetName && (
-                    <p className="mt-1 text-xs text-amber-200/90">
+                    <p className="mt-1 text-xs text-amber-800/90">
                       Interjects to <span className="font-medium">{t.targetName}</span>
                     </p>
                   )}
@@ -119,7 +183,10 @@ export function DebateTranscript({
       </section>
 
       {showOptionsAfterDebate && voteOptions && voteOptions.length > 0 && (
-        <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
+        <section
+          id="debate-vote-section"
+          className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
+        >
           <h2 className="text-sm font-semibold text-[var(--foreground)]">
             {voteTally ? "Vote options" : "Decision options"}
           </h2>
@@ -134,15 +201,15 @@ export function DebateTranscript({
       )}
 
       {voteTally && (
-        <section className="rounded-lg border border-white/10 bg-[var(--card)] p-4">
+        <section className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
           <h2 className="text-sm font-semibold text-[var(--foreground)]">Vote tally</h2>
           <p className="mt-2 text-sm text-[var(--muted)]">
             Threshold: at least <strong className="text-[var(--foreground)]">{voteTally.threshold}</strong> of{" "}
             {DEBATE_AGENTS.length} on one option.
             {voteTally.consensus_reached ? (
-              <span className="ml-2 text-green-400">Consensus reached.</span>
+              <span className="ml-2 text-[var(--accent)]">Consensus reached.</span>
             ) : (
-              <span className="ml-2 text-amber-400">No single-option majority at threshold.</span>
+              <span className="ml-2 text-amber-700">No single-option majority at threshold.</span>
             )}
           </p>
           {voteTally.winning_option_id != null && voteTally.consensus_reached && (
@@ -157,13 +224,13 @@ export function DebateTranscript({
             {Object.entries(voteTally.tallies).map(([id, n]) => (
               <li
                 key={id}
-                className="rounded-md border border-white/10 px-3 py-1 font-mono text-[var(--muted)]"
+                className="rounded-md border border-[var(--border)] px-3 py-1 font-mono text-[var(--muted)]"
               >
                 {id}: {n}
               </li>
             ))}
           </ul>
-          <ul className="mt-3 flex flex-col gap-2 border-t border-white/10 pt-3 text-sm text-[var(--muted)]">
+          <ul className="mt-3 flex flex-col gap-2 border-t border-[var(--border)] pt-3 text-sm text-[var(--muted)]">
             {voteTally.votes.map((v) => (
               <li key={v.agent_id}>
                 <span className="text-[var(--foreground)]">{v.name}</span> →{" "}
@@ -177,10 +244,11 @@ export function DebateTranscript({
 
       {(chiefSynthPending || report) && (
         <section
+          id="chief-synth-summary"
           className={`rounded-lg border p-4 ${
             report
-              ? "border-white/10 bg-[var(--card)]"
-              : "border-indigo-400/35 bg-indigo-950/25"
+              ? "border-[var(--border)] bg-[var(--card)]"
+              : "border-[var(--accent)]/30 bg-[var(--accent-muted)]/40"
           }`}
           aria-live="polite"
         >
@@ -190,41 +258,15 @@ export function DebateTranscript({
               Writing your structured summary (overview, ranked options, risks, next steps)…
             </p>
           )}
-          {report && (
-            <>
-              <p className="mt-3 text-sm leading-relaxed">{report.summary}</p>
-              <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-                Ranked options
-              </h3>
-              <ul className="mt-2 flex flex-col gap-2">
-                {report.ranked_options.map((o) => (
-                  <li key={o.title} className="rounded-md border border-white/5 p-3 text-sm">
-                    <div className="flex justify-between gap-2">
-                      <span className="font-medium">{o.title}</span>
-                      <span className="text-[var(--muted)]">{(o.score * 100).toFixed(0)}%</span>
-                    </div>
-                    <p className="mt-1 text-[var(--muted)]">{o.rationale}</p>
-                  </li>
-                ))}
-              </ul>
-              <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-                Risks
-              </h3>
-              <ul className="mt-1 list-inside list-disc text-sm text-[var(--muted)]">
-                {report.risks.map((r) => (
-                  <li key={r}>{r}</li>
-                ))}
-              </ul>
-              <h3 className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-                Next steps
-              </h3>
-              <ul className="mt-1 list-inside list-decimal text-sm">
-                {report.next_steps.map((s) => (
-                  <li key={s}>{s}</li>
-                ))}
-              </ul>
-            </>
-          )}
+          {report && collapseReport ? (
+            <details className="mt-3 text-sm">
+              <summary className="cursor-pointer font-medium text-[var(--accent)] hover:underline">
+                Expand full decision brief
+              </summary>
+              <ReportBody report={report} />
+            </details>
+          ) : null}
+          {report && !collapseReport ? <ReportBody report={report} /> : null}
         </section>
       )}
 

@@ -22,6 +22,7 @@ from app.debate.environment_adapter import (
 )
 from app.debate.context_options import parse_options_from_context
 from app.debate.environment_ops import init_environment, merge_options, snapshot_for_api
+from app.debate.vote_derivation import pick_agent_vote_option, vote_rationale_for_agent
 from app.debate.schemas import (
     AgentStanceItem,
     AgentVoteResponse,
@@ -30,7 +31,9 @@ from app.debate.schemas import (
     FinalReport,
     RankedOption,
     SYNTH_API_TIMEOUT_SEC,
+    SYNTH_MIN_SEC,
     SYNTH_RESERVE_SEC,
+    SYNTH_TRANSCRIPT_MAX_CHARS,
     MIN_DEBATE_TURN_SEC,
     OPTION_SEED_MAX_SEC,
     VoteOptionItem,
@@ -650,11 +653,12 @@ _DEFAULT_VOTE_OPTIONS = [
 
 
 def _synth_model_candidates(llm: Settings, request_model: str) -> list[str]:
+    """Prefer the fast debate model first so synthesis finishes within the reserve window."""
     seen: set[str] = set()
     out: list[str] = []
     for candidate in (
-        llm.resolved_synth_model(request_model),
         llm.resolved_debate_model(request_model),
+        llm.resolved_synth_model(request_model),
         (request_model or "").strip(),
         getattr(llm, "llm_default_model", "") or "",
     ):
@@ -662,6 +666,89 @@ def _synth_model_candidates(llm: Settings, request_model: str) -> list[str]:
             seen.add(candidate)
             out.append(candidate)
     return out
+
+
+def _build_report_from_votes(
+    *,
+    context: str,
+    id_to_title: dict[str, str],
+    tallies: dict[str, int],
+    vote_records: list[dict[str, str]],
+    consensus_reached: bool,
+    winning_option_id: str | None,
+    winning_title: str,
+    threshold: int,
+) -> FinalReport:
+    """Deterministic brief when the synthesizer LLM times out or fails."""
+    n_agents = max(sum(tallies.values()), len(AGENTS), 1)
+    ranked_pairs = sorted(
+        tallies.items(),
+        key=lambda kv: (-kv[1], int(kv[0]) if kv[0].isdigit() else 99),
+    )
+    ranked_options: list[RankedOption] = []
+    for oid, count in ranked_pairs[:4]:
+        title = id_to_title.get(oid, f"Option {oid}")
+        score = round(count / n_agents, 2)
+        ranked_options.append(
+            RankedOption(
+                title=title,
+                score=score,
+                rationale=f"{count} of {n_agents} advisors voted for this path.",
+            )
+        )
+    if not ranked_options and winning_title:
+        ranked_options.append(
+            RankedOption(title=winning_title, score=0.5, rationale="Leading option from panel vote.")
+        )
+
+    if consensus_reached and winning_title:
+        summary = (
+            f"The panel reached consensus (at least {threshold} of {n_agents}) on "
+            f"“{winning_title}”. The debate weighed tradeoffs across the options below; "
+            f"use the transcript for dissenting views and nuance."
+        )
+    elif ranked_pairs:
+        parts = [
+            f"“{id_to_title.get(oid, oid)}” ({count})"
+            for oid, count in ranked_pairs[:3]
+        ]
+        summary = (
+            f"No single option hit the consensus threshold ({threshold} of {n_agents}). "
+            f"Vote split: {', '.join(parts)}. Review the transcript for where advisors diverged."
+        )
+    else:
+        summary = (
+            "The panel finished debate but votes were inconclusive. "
+            "Use the transcript and options below to decide next steps."
+        )
+
+    dissent = [
+        vr
+        for vr in vote_records
+        if winning_option_id and vr.get("option_id") != winning_option_id
+    ]
+    risks: list[str] = []
+    if dissent:
+        names = ", ".join(vr.get("name", vr.get("agent_id", "")) for vr in dissent[:3])
+        risks.append(f"Dissenting voices ({names}) flagged concerns with the leading option.")
+    if len(ranked_pairs) >= 2 and ranked_pairs[0][1] - ranked_pairs[1][1] <= 1:
+        risks.append("The vote was close—execution risk if you commit without addressing minority views.")
+    if not risks:
+        risks.append("Validate assumptions from the debate against real data before committing.")
+
+    ctx_snip = context.strip().replace("\n", " ")[:160]
+    next_steps = [
+        f"Confirm the decision against your original brief: {ctx_snip}…" if ctx_snip else "Confirm the decision against your original brief.",
+        "Share this brief with stakeholders and note who dissented.",
+        "Set 1–2 measurable checkpoints in the next two weeks based on the winning path.",
+    ]
+
+    return FinalReport(
+        summary=summary,
+        ranked_options=ranked_options,
+        risks=risks[:4],
+        next_steps=next_steps[:4],
+    )
 
 
 async def _create_json_completion(
@@ -695,6 +782,21 @@ def _seconds_until(deadline: float | None) -> float:
     if deadline is None:
         return float("inf")
     return max(0.0, deadline - time.monotonic())
+
+
+def _transcript_for_synth(transcript: str) -> str:
+    """Keep synthesis prompt bounded when debates run long."""
+    t = transcript.strip()
+    cap = SYNTH_TRANSCRIPT_MAX_CHARS
+    if len(t) <= cap:
+        return t
+    head_budget = min(2000, cap // 4)
+    tail_budget = cap - head_budget - 80
+    return (
+        f"{t[:head_budget]}\n\n"
+        "[... middle of debate omitted for synthesis time budget ...]\n\n"
+        f"{t[-tail_budget:]}"
+    )
 
 
 def _instant_default_closing() -> ClosingPhaseResponse:
@@ -789,7 +891,7 @@ async def ensure_session_options(
 
 
 def _closing_from_environment(se: DebateEnvironment | None) -> ClosingPhaseResponse:
-    """Votes from debate: each advisor's last focused option, else panel-wide support leader."""
+    """Votes from each advisor's support/attack history and persona — not a single panel pick."""
     if se is None or len(se.options_by_id) < 2:
         return _instant_default_closing()
 
@@ -798,12 +900,8 @@ def _closing_from_environment(se: DebateEnvironment | None) -> ClosingPhaseRespo
         key=lambda x: int(x.id) if x.id.isdigit() else 99,
     )
     allowed = {o.id for o in vote_opts}
-    panel_pick = vote_opts[0].id
-    if se.option_support_scores:
-        panel_pick = max(
-            allowed,
-            key=lambda k: float(se.option_support_scores.get(k, 0.5)),
-        )
+    fallback = vote_opts[0].id
+    panel_pick = _panel_pick_from_env(se, allowed, fallback)
 
     default_stances = [
         AgentStanceItem(agent_id=a["id"], lean="unknown", confidence=0.0, note="")
@@ -812,15 +910,24 @@ def _closing_from_environment(se: DebateEnvironment | None) -> ClosingPhaseRespo
     vote_items: list[ClosingVoteItem] = []
     for a in AGENTS:
         aid = a["id"]
-        st = se.agent_state_by_id.get(aid)
-        oid = st.focus_option_id if st and st.focus_option_id in allowed else panel_pick
-        vote_items.append(ClosingVoteItem(agent_id=aid, option_id=oid, rationale=""))
+        oid = pick_agent_vote_option(se, aid, allowed, panel_pick=panel_pick)
+        rationale = vote_rationale_for_agent(se, aid, oid)
+        vote_items.append(ClosingVoteItem(agent_id=aid, option_id=oid, rationale=rationale))
 
     return ClosingPhaseResponse(
         options=vote_opts,
         votes=vote_items,
         agent_stances=default_stances,
     )
+
+
+def _panel_pick_from_env(se: DebateEnvironment, allowed: set[str], fallback: str) -> str:
+    if se.option_support_scores:
+        return max(
+            allowed,
+            key=lambda k: float(se.option_support_scores.get(k, 0.5)),
+        )
+    return fallback
 
 
 def _closing_from_context(context: str) -> ClosingPhaseResponse:
@@ -992,7 +1099,7 @@ async def run_post_debate_phases(
 
     synth_user = (
         f"Decision context:\n{context}\n\n"
-        f"Full debate transcript:\n{transcript}\n\n"
+        f"Debate transcript:\n{_transcript_for_synth(transcript)}\n\n"
         f"Vote summary (JSON):\n{vote_summary}\n\n"
         f"Agent stance trace (JSON):\n{stance_summary}\n\n"
     )
@@ -1019,18 +1126,16 @@ async def run_post_debate_phases(
     )
 
     win_title = id_to_title.get(winning_option_id or "", "Options")
-    base_ranked = [
-        RankedOption(
-            title=win_title,
-            score=0.5,
-            rationale="Fallback while the full report was unavailable.",
-        )
-    ]
 
     try:
         t_synth0 = time.monotonic()
-        synth_timeout = min(float(SYNTH_API_TIMEOUT_SEC), _seconds_until(session_deadline))
-        logger.info("synthesizer_llm_begin timeout_sec=%.2f", synth_timeout)
+        remaining = _seconds_until(session_deadline)
+        synth_timeout = max(float(SYNTH_MIN_SEC), min(float(SYNTH_API_TIMEOUT_SEC), remaining))
+        logger.info(
+            "synthesizer_llm_begin timeout_sec=%.2f remaining_until_deadline=%.2f",
+            synth_timeout,
+            remaining,
+        )
         if synth_timeout <= 0:
             raise asyncio.TimeoutError("no time left for synthesizer")
         _, resp = await asyncio.wait_for(
@@ -1039,7 +1144,7 @@ async def run_post_debate_phases(
                 models=synth_models,
                 messages=synth_msgs,
                 llm=llm,
-                max_tokens=2048,
+                max_tokens=1024,
             ),
             timeout=synth_timeout,
         )
@@ -1048,33 +1153,31 @@ async def run_post_debate_phases(
     except asyncio.TimeoutError:
         synth_llm_sec = time.monotonic() - t_synth0
         logger.warning(
-            "synthesizer_llm_timeout elapsed_sec=%.2f limit=%.2f",
+            "synthesizer_llm_timeout elapsed_sec=%.2f limit=%.2f — using vote-derived brief",
             synth_llm_sec,
             synth_timeout,
         )
-        report = FinalReport(
-            summary=(
-                "The Chief Synthesizer hit the server time limit while generating the report. "
-                "Votes and transcript above are still valid."
-            ),
-            ranked_options=base_ranked,
-            risks=[
-                "Structured report timed out—use the vote tally and transcript as the source of truth."
-            ],
-            next_steps=[
-                "Retry (or pick a faster model / shorter debate) if this happens often.",
-            ],
+        report = _build_report_from_votes(
+            context=context,
+            id_to_title=id_to_title,
+            tallies=tallies,
+            vote_records=vote_records,
+            consensus_reached=consensus_reached,
+            winning_option_id=winning_option_id,
+            winning_title=id_to_title.get(winning_option_id or "", win_title),
+            threshold=threshold,
         )
     except Exception:
         logger.warning("Chief Synthesizer API call failed", exc_info=True)
-        report = FinalReport(
-            summary=(
-                "The Chief Synthesizer request did not complete (API or network error). "
-                "See transcript and votes above."
-            ),
-            ranked_options=base_ranked,
-            risks=["Final narrative unavailable—provider or connectivity may be at fault."],
-            next_steps=["Retry when the API is responsive; check keys and model availability."],
+        report = _build_report_from_votes(
+            context=context,
+            id_to_title=id_to_title,
+            tallies=tallies,
+            vote_records=vote_records,
+            consensus_reached=consensus_reached,
+            winning_option_id=winning_option_id,
+            winning_title=id_to_title.get(winning_option_id or "", win_title),
+            threshold=threshold,
         )
     else:
         try:
@@ -1085,14 +1188,15 @@ async def run_post_debate_phases(
             report = _parse_final_report(raw)
         except Exception:
             logger.warning("Chief Synthesizer returned unparseable JSON", exc_info=True)
-            report = FinalReport(
-                summary=(
-                    "The Chief Synthesizer returned output we could not parse into the report format. "
-                    "Use the transcript and votes above."
-                ),
-                ranked_options=base_ranked,
-                risks=["Report JSON was invalid or incomplete—panel discussion remains usable."],
-                next_steps=["Re-run the debate or retry; if it recurs, try another model."],
+            report = _build_report_from_votes(
+                context=context,
+                id_to_title=id_to_title,
+                tallies=tallies,
+                vote_records=vote_records,
+                consensus_reached=consensus_reached,
+                winning_option_id=winning_option_id,
+                winning_title=id_to_title.get(winning_option_id or "", win_title),
+                threshold=threshold,
             )
 
     se = session_env_box[0]
@@ -1363,6 +1467,6 @@ async def run_debate_stream(
         session_env_box=[session_env],
         synth_env_snapshot=synth_env_snapshot,
         effective_track=effective_track,
-        session_deadline=t0 + total_sec,
+        session_deadline=time.monotonic() + float(SYNTH_RESERVE_SEC),
     ):
         yield ev

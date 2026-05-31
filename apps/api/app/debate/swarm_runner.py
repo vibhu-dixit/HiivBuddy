@@ -338,6 +338,6 @@ async def run_swarm_session_stream(
         session_env_box=[session_env],
         synth_env_snapshot=synth_env_snapshot,
         effective_track=effective_track,
-        session_deadline=session_deadline,
+        session_deadline=time.monotonic() + float(SYNTH_RESERVE_SEC),
     ):
         yield ev
