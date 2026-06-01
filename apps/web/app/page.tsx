@@ -87,8 +87,36 @@ export default function LandingPage() {
         onConfirm={handleDemoConfirm}
       />
       <footer className="border-t border-[var(--border)] bg-[var(--card)] py-8">
-        <div className="mx-auto max-w-6xl px-6 text-sm text-[var(--muted)]">
+        <div className="mx-auto flex max-w-6xl flex-col gap-2 px-6 text-sm text-[var(--muted)] sm:flex-row sm:items-center sm:justify-between">
           <span>© {new Date().getFullYear()} Hiiv</span>
+          <p className="flex flex-wrap items-center gap-x-1 gap-y-1">
+            {LANDING_COPY.footer.builtByLabel}{" "}
+            <span className="font-medium text-[var(--foreground)]">
+              {LANDING_COPY.footer.authorName}
+            </span>
+            <span className="text-[var(--border)]" aria-hidden>
+              ·
+            </span>
+            <a
+              href={LANDING_COPY.footer.githubUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline decoration-[var(--border)] underline-offset-2 hover:text-[var(--accent)] hover:decoration-[var(--accent)]"
+            >
+              GitHub
+            </a>
+            <span className="text-[var(--border)]" aria-hidden>
+              ·
+            </span>
+            <a
+              href={LANDING_COPY.footer.linkedInUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline decoration-[var(--border)] underline-offset-2 hover:text-[var(--accent)] hover:decoration-[var(--accent)]"
+            >
+              LinkedIn
+            </a>
+          </p>
         </div>
       </footer>
     </div>

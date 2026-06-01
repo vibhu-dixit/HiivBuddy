@@ -76,6 +76,13 @@ export const LANDING_COPY = {
     confirm: "Open Decision Room",
     confirmBusy: "Opening…",
   },
+
+  footer: {
+    builtByLabel: "Built by",
+    authorName: "Vibhu Dixit",
+    githubUrl: "https://github.com/vibhu-dixit",
+    linkedInUrl: "https://www.linkedin.com/in/vibhu-dixit-swe",
+  },
 } as const;
 
 export const PANEL_MEMBERS = [
