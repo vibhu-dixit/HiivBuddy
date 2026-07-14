@@ -1,0 +1,13 @@
+﻿#!/usr/bin/env python3
+import os, sys, subprocess
+from pathlib import Path
+
+ENGINE_DIR = os.environ.get("HOTFIX_ENGINE_DIR", r"C:\Projects\hotfix-context-engine")
+venv_python = Path(ENGINE_DIR) / ".venv" / "Scripts" / "python.exe"
+python = str(venv_python) if venv_python.exists() else sys.executable
+REPO_ROOT = str(Path(__file__).parent.parent.resolve())
+
+print("🔁 hotfix-context-engine: ingesting commit context into Supermemory...")
+r = subprocess.run([python, "-m", "ingestion.handler", "--repo", REPO_ROOT], cwd=ENGINE_DIR)
+print("✅ ingestion complete." if r.returncode == 0 else "⚠️  ingestion failed.")
+sys.exit(0)
