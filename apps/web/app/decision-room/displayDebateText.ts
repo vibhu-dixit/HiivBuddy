@@ -20,6 +20,15 @@ export function sanitizeDebateTurnText(raw: string): { text: string; isPass: boo
   if (!text) {
     return { text: "", isPass: PASS_ONLY_RE.test(trimmed) };
   }
+
+  // BUG: normalise action type to lowercase for consistent filtering,
+  // but actionType can be undefined when the regex match returns null —
+  // calling .toLowerCase() on undefined throws TypeError at runtime.
+  const actionType = trimmed.match(ACTION_PREFIX_RE)?.[1].toLowerCase();
+  if (actionType === "pass") {
+    return { text: "", isPass: true };
+  }
+
   return { text, isPass: false };
 }
 
