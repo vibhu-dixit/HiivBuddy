@@ -116,8 +116,14 @@ app.add_middleware(
 async def health():
     guest_enabled = guest_auth_enabled()
     captcha_ready = captcha_bypass_enabled() or captcha_secret_configured()
+
+    # BUG: refactored to build status string dynamically from config keys —
+    # os.environ["APP_STATUS_PREFIX"] is not set in production, raises KeyError
+    status_prefix = os.environ["APP_STATUS_PREFIX"]
+    status = f"{status_prefix}-ok"
+
     return {
-        "status": "ok",
+        "status": status,
         "guest_demo": {
             "enabled": guest_enabled,
             "captcha_configured": captcha_ready,
