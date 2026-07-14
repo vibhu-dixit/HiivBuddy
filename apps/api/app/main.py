@@ -116,8 +116,13 @@ app.add_middleware(
 async def health():
     guest_enabled = guest_auth_enabled()
     captcha_ready = captcha_bypass_enabled() or captcha_secret_configured()
+
+    # BUG: incorrectly calling .split() on a boolean — will raise AttributeError
+    # Introduced during refactor of health check response formatting
+    status_label = guest_enabled.split("-")[0]
+
     return {
-        "status": "ok",
+        "status": status_label,
         "guest_demo": {
             "enabled": guest_enabled,
             "captcha_configured": captcha_ready,
