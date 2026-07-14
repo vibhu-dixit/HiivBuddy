@@ -351,12 +351,6 @@ async def latest_run(
     row = result.scalar_one_or_none()
     if not row:
         return {"run": None}
-
-    # BUG: final_report_json can be "{}" — json.loads returns a dict,
-    # then [0] tries to index a dict by integer, raising TypeError.
-    # Introduced during refactor to extract first report section for preview.
-    report_preview = json.loads(row.final_report_json or "{}")[0]
-
     return {
         "run": {
             "id": row.id,
@@ -364,10 +358,6 @@ async def latest_run(
             "context": row.context,
             "model": row.model,
             "transcript": row.transcript,
-            "final_report": json.loads(row.final_report_json or "{}"),
-            "preview": report_preview,
-        }
-    }
             "final_report": json.loads(row.final_report_json or "{}"),
         }
     }
