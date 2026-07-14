@@ -12,7 +12,7 @@ export const LANDING_COPY = {
     headline: "Make the call with confidence—",
     headlineAccent: "not guesswork",
     subhead:
-      "When the stakes are high, one opinion is not enough. Hiiv runs a short advisory session on your real decision and hands you a written brief: ranked options, risks, and next steps.",
+      "Five AI advisors challenge your thinking, debate the trade-offs, and deliver a clear recommendation in under three minutes. Whether you're deciding to pivot, hire, raise prices, or raise funding, Hiiv helps you think like an experienced board—not a chatbot.",
     deliverable:
       "About three minutes per session. Export a summary when you are ready to share it with your team or board.",
     ctaPrimary: "Try demo",

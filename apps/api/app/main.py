@@ -5,6 +5,22 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
+
+# ── Sentry — initialise before anything else so all errors are captured ───────
+sentry_sdk.init(
+    dsn="https://8a027b54097a0fdb666e3c4783e26288@o4511729199480832.ingest.us.sentry.io/4511729368039424",
+    send_default_pii=True,
+    integrations=[
+        StarletteIntegration(),
+        FastApiIntegration(),
+    ],
+    traces_sample_rate=1.0,
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
 import asyncpg
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
