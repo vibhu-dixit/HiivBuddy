@@ -220,3 +220,5 @@ The web app is a standard **Next.js** app under **`apps/web`**; the API is **Fas
 ## Product note
 
 The original product vision (broader roadmap: teams, long-term memory, billing, exports) lives in **`Hivvbuddy.pdf`** in this repo. This codebase focuses on the **core loop**: timed debate → vote → report, with persistence in PostgreSQL.
+
+<!-- hook test -->
