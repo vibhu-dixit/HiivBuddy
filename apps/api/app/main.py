@@ -56,7 +56,7 @@ from app.debate.orchestrator import AGENTS, run_debate_stream
 from app.debate.swarm_runner import run_swarm_session_stream
 from app.context_ingest import extract_text_from_upload
 from app.debate.schemas import DebateRequest
-#from app.llm.client import get_async_client, get_settings
+from app.llm.client import get_async_client, get_settings
 
 logger = logging.getLogger(__name__)
 
