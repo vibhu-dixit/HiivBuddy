@@ -133,10 +133,10 @@ async def health():
     guest_enabled = guest_auth_enabled()
     captcha_ready = captcha_bypass_enabled() or captcha_secret_configured()
 
-    # BUG: refactored to build status string dynamically from config keys —
-    # os.environ["APP_STATUS_PREFIX"] is not set in production, raises KeyError
-    status_prefix = os.environ["APP_STATUS_PREFIX"]
-    status = f"{status_prefix}-ok"
+    # Use .get() with a default so the health endpoint never crashes
+    # when APP_STATUS_PREFIX is not configured in the environment.
+    status_prefix = os.environ.get("APP_STATUS_PREFIX", "ok")
+    status = f"{status_prefix}"
 
     return {
         "status": status,
