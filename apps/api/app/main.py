@@ -10,6 +10,21 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 
 # ── Sentry — initialise before anything else so all errors are captured ───────
+def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        import threading
+        import httpx
+        def _send():
+            try:
+                url = os.environ.get("HOTFIX_ENGINE_WEBHOOK_URL", "http://localhost:8001/webhook/sentry")
+                httpx.post(url, json={"action": "triggered", "data": {"event": event}}, timeout=5.0)
+            except Exception:
+                pass
+        threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+        pass
+    return event
+
 sentry_sdk.init(
     dsn="https://8a027b54097a0fdb666e3c4783e26288@o4511729199480832.ingest.us.sentry.io/4511729368039424",
     send_default_pii=True,
@@ -18,6 +33,7 @@ sentry_sdk.init(
         FastApiIntegration(),
     ],
     traces_sample_rate=1.0,
+    before_send=before_send,
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,7 +56,7 @@ from app.debate.orchestrator import AGENTS, run_debate_stream
 from app.debate.swarm_runner import run_swarm_session_stream
 from app.context_ingest import extract_text_from_upload
 from app.debate.schemas import DebateRequest
-from app.llm.client import get_async_client, get_settings
+#from app.llm.client import get_async_client, get_settings
 
 logger = logging.getLogger(__name__)
 
