@@ -236,7 +236,7 @@ async def debate_event_stream(
                     event.get("turns_completed", 0),
                 )
                 transcript_parts.append(
-                    f"--- Debate phase end (turns: {event.get('turns_completed', 0)}) ---",
+                    f--- Debate phase end (turns: {event.get('turns_completed', 0)}) ---",
                 )
             elif et == "decision_options":
                 logger.info("sse decision_options count=%s", len(event.get("options") or []))
